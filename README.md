@@ -183,13 +183,6 @@ cmake --build --preset release
 
 The result is `build/release/boz.nro`.
 
-The parts of the loader that do not need a console have unit tests that build with any C compiler
-on Linux:
-
-```sh
-make test
-```
-
 ### Layout
 
 - `src/s3e_*.c`: the S3E API, one file per area (files, graphics, sound, input, timers, network).
