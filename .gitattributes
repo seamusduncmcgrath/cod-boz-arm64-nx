@@ -1,0 +1,3 @@
+# Sources are kept with LF line endings whatever git is configured to do; cmd.exe wants CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf

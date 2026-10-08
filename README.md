@@ -3,10 +3,10 @@
 An unofficial homebrew port of the mobile game *Call of Duty: Black Ops Zombies* to the Nintendo
 Switch.
 
-The port is a loader, not a rewrite. It takes the game's own 64-bit ARM code from the Android
-release, runs it natively on the Switch, and supplies everything that code expects from the
-phone it was written for: files, graphics, sound, input and timing. On top of that it gives the
-game a console-style controller layout, a wider field of view and 60 frames per second.
+The port is a loader, not a rewrite. It takes the game's own 64-bit ARM code, runs it natively on
+the Switch, and supplies everything that code expects from the phone it was written for: files,
+graphics, sound, input and timing. On top of that it gives the game a console-style controller
+layout, a wider field of view and 60 frames per second.
 
 ## What you need
 
@@ -98,10 +98,11 @@ range is replaced by the default, and the log says so.
 ## How it works
 
 The game was built with the Marmalade SDK, which packages a game as an *S3E image*: a block of
-machine code with no ties to any operating system. It does not call Android. Everything it wants
-from the outside world it asks for through a fixed list of named functions, the S3E API, together
-with OpenGL ES and EGL for graphics. This game's image names 395 of them. That makes the code
-portable to anything that can run 64-bit ARM code and answer those calls, which a Switch can.
+machine code with no ties to any operating system. It never calls the phone's own system.
+Everything it wants from the outside world it asks for through a fixed list of named functions,
+the S3E API, together with OpenGL ES and EGL for graphics. This game's image names 395 of them.
+That makes the code portable to anything that can run 64-bit ARM code and answer those calls,
+which a Switch can.
 
 **Loading.** At launch the loader reads `assets/boz_aarch64.s3e`, which is stored
 LZMA-compressed, and unpacks it in memory. It copies the code to where it will run, rewrites the
@@ -190,7 +191,6 @@ The result is `build/release/boz.nro`.
 - `src/switch/`: the entry point, executable memory, and a stand-in for `dlopen` over the
   libraries linked into the NRO.
 - `include/`: headers.
-- `tests/`: host-side unit tests.
 - `third_party/lzma/`: the LZMA SDK's decoder, which is in the public domain.
 
 ## Credits and licence

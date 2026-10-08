@@ -22,7 +22,7 @@
 enum {
     DISPLAY_WIDTH = 1280,
     DISPLAY_HEIGHT = 720,
-    /* A main thread's stack on Android, which the game was built for. */
+    /* As much stack as a main thread has on Android, where this image otherwise runs. */
     GAME_STACK_SIZE = 8 * 1024 * 1024,
 };
 
