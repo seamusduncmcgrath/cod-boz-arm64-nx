@@ -15,22 +15,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
-#if defined(__arm__)
-#define S3E_SOFTFP __attribute__((pcs("aapcs")))
-#else
-#define S3E_SOFTFP
-#endif
-
-typedef int32_t(S3E_SOFTFP *s3e_callback_fn)(void *system_data, void *user_data);
-typedef int32_t(S3E_SOFTFP *s3e_socket_callback_fn)(void *socket, void *system_data,
-                                                    void *user_data);
-typedef int32_t(S3E_SOFTFP *s3e_zeroconf_callback_fn)(void *search, void *system_data,
-                                                      void *user_data);
+typedef int32_t (*s3e_callback_fn)(void *system_data, void *user_data);
+typedef int32_t (*s3e_socket_callback_fn)(void *socket, void *system_data, void *user_data);
+typedef int32_t (*s3e_zeroconf_callback_fn)(void *search, void *system_data, void *user_data);
 
 typedef unsigned int GLenum;
 typedef unsigned char GLboolean;
@@ -58,8 +49,8 @@ enum {
 };
 
 #define S3E_CONFIG_MAX_ENTRIES 512
-#define DTRZ_MAX_ENTRIES 512
-#define DTRZ_NAME_MAX 192
+/* How many imports the loader does not implement can each have a stub that names it. */
+#define S3E_NAMED_STUB_MAX 16
 #define IS_DEVICE_RESOURCES_SIZE 0x728
 #define IS_DEVICE_RESOURCE_PATH_A 0x428
 #define IS_DEVICE_RESOURCE_PATH_B 0x527
@@ -75,27 +66,6 @@ struct s3e_config_entry {
     char section[64];
     char key[96];
     char value[256];
-};
-
-struct dtrz_entry {
-    char name[DTRZ_NAME_MAX];
-    char lower_name[DTRZ_NAME_MAX];
-    char lower_base[DTRZ_NAME_MAX];
-    uint32_t offset;
-    uint32_t size;
-};
-
-struct dtrz_index {
-    int loaded;
-    size_t count;
-    char path[1200];
-    struct dtrz_entry entries[DTRZ_MAX_ENTRIES];
-};
-
-struct memory_file {
-    FILE *file;
-    void *buffer;
-    struct memory_file *next;
 };
 
 struct timer_event {
@@ -283,35 +253,12 @@ struct s3e_zeroconf_txt_update_data {
     const char **txt_records;
 };
 
-#if UINTPTR_MAX == UINT32_MAX
-_Static_assert(offsetof(struct s3e_zeroconf_found_data, name) == 0x08,
-               "s3eZeroConf found name offset changed");
-_Static_assert(offsetof(struct s3e_zeroconf_found_data, port) == 0x18,
-               "s3eZeroConf found port offset changed");
-_Static_assert(offsetof(struct s3e_zeroconf_found_data, txt_records) == 0x1c,
-               "s3eZeroConf found TXT offset changed");
-_Static_assert(offsetof(struct s3e_zeroconf_found_data, ipv4_address) == 0x20,
-               "s3eZeroConf found IPv4 offset changed");
-_Static_assert(sizeof(struct s3e_zeroconf_found_data) == 0x38,
-               "s3eZeroConf found data size changed");
-_Static_assert(offsetof(struct s3e_zeroconf_txt_update_data, txt_count) == 0x06,
-               "s3eZeroConf TXT count offset changed");
-_Static_assert(offsetof(struct s3e_zeroconf_txt_update_data, txt_records) == 0x08,
-               "s3eZeroConf TXT pointer offset changed");
-_Static_assert(sizeof(struct s3e_zeroconf_txt_update_data) == 0x0c,
-               "s3eZeroConf TXT update size changed");
-#endif
-
 extern char g_root[1024];
 extern void *g_egl;
 extern void *g_gles1;
 extern void *g_gles2;
-extern uint8_t *g_stub_code;
-extern size_t g_stub_code_size;
-extern const char *g_stub_names[512];
+extern const char *g_stub_names[S3E_NAMED_STUB_MAX];
 extern size_t g_stub_count;
-extern struct dtrz_index g_dtrz;
-extern struct memory_file *g_memory_files;
 extern struct timer_event *g_timers;
 extern pthread_mutex_t g_timer_mutex;
 extern struct fbdev_window g_native_window;
@@ -331,17 +278,37 @@ extern uint64_t g_host_start_us;
 uint64_t monotonic_us(void);
 uint64_t monotonic_ms(void);
 void sleep_ms(uint32_t ms);
+/* Frames are held to 60 a second unless this asks for another rate. */
+void video_set_frame_rate(uint32_t frames_per_second);
 void *open_first(const char *const *names);
 void *lookup_gl(const char *symbol);
 void *lookup_egl(const char *symbol);
-void codboz_hide_virtual_stick_artwork(const char *name, uint8_t *data, size_t size);
 bool egl_backend_load_libraries(void);
 void *egl_backend_resolve(const char *symbol);
 void *egl_backend_get_proc_address(const char *symbol);
 void *egl_backend_get_gl_proc(const char *symbol);
 EGLBoolean egl_backend_swap_buffers(EGLDisplay display, EGLSurface surface);
 void egl_backend_shutdown(void);
+/* Entry points into the game for actions that its key bindings do not reach or do not hold. */
+struct input_hud_handlers {
+    void (*reload)(void);
+    void (*change_weapon)(void);
+    void (*grenade_hold)(void);
+    void (*grenade_throw)(void);
+    /* Called on every keyboard update while the fire button is held. */
+    void (*fire)(void);
+    void (*crouch)(void);
+    void (*prone)(void);
+    /* Uses whatever the player is standing at, without the sprint the game's key adds. */
+    void (*action)(void);
+    void (*sprint_start)(void);
+    void (*sprint_stop)(void);
+    /* Called on every keyboard update, held button or not. */
+    void (*frame)(void);
+};
+
 void input_pump(void);
+void input_set_hud_handlers(const struct input_hud_handlers *handlers);
 void input_shutdown(void);
 void audio_shutdown(void);
 int32_t audio_unit_backend_set_callbacks(void *capture_callback, void *render_callback);
@@ -382,9 +349,12 @@ int32_t s3eFileGetFileInt(void *file, uint32_t key);
 int32_t s3eFileMakeDirectory(const char *name);
 int32_t s3eFileDelete(const char *name);
 int32_t s3eFileRename(const char *old_name, const char *new_name);
-int32_t s3eFileAddUserFileSys(const char *prefix, const char *path);
+int32_t s3eFileAddUserFileSys(const void *file_system);
 void *s3eFileListDirectory(const char *path);
 int32_t s3eFileListClose(void *list);
+
+int32_t s3eSecureStorageGet(void *data, uint16_t size);
+int32_t s3eSecureStoragePut(const void *data, uint16_t size);
 
 void *s3eCompressionDecompInit(uint32_t type);
 int32_t s3eCompressionDecompRead(void *context, const void *source, uint32_t source_len,
@@ -422,7 +392,7 @@ void s3eDebugPrint(int32_t channel, const char *text, int32_t color);
 int32_t s3eDebugGetInt(uint32_t key);
 int32_t s3eDebugIsDebuggerPresent(void);
 void s3eDebugTraceLine(const char *text);
-int32_t s3eDebugAssertShow(void);
+int32_t s3eDebugAssertShow(uint32_t type, const char *text);
 int32_t s3eDebugErrorShow(uint32_t flags, const char *text);
 
 int32_t s3eKeyboardRegister(uint32_t id, void *callback, void *user_data);
@@ -457,6 +427,7 @@ int32_t s3eAccelerometerGetX(void);
 int32_t s3eAccelerometerGetY(void);
 int32_t s3eAccelerometerGetZ(void);
 int32_t s3eAccelerometerGetInt(uint32_t key);
+int32_t s3eVibraVibrate(uint8_t priority, uint32_t ms);
 int32_t s3eVideoGetInt(uint32_t key);
 int32_t s3eVideoPlay(const char *filename, uint32_t repeat);
 int32_t s3eVideoStop(void);
@@ -492,6 +463,7 @@ uint32_t s3eInetNtohl(uint32_t value);
 uint16_t s3eInetHtons(uint16_t value);
 uint16_t s3eInetNtohs(uint16_t value);
 int32_t s3eInetAton(uint32_t *out, const char *address);
+int32_t s3eInetPton(const char *address, void *out, uint32_t *length);
 char *s3eInetNtoa(uint32_t address, char *buffer, int32_t length);
 const char *s3eInetToString(const struct s3e_inet_address *address, int32_t include_port);
 int32_t s3eInetLookup(const char *hostname, struct s3e_inet_address *address, void *callback,
@@ -565,7 +537,6 @@ int32_t isDeviceGetDisplayType(void);
 void *isDeviceGetExternalResources(void);
 int32_t is_audio_unit_get_interface(void *iface, uint32_t size);
 int32_t s3eExtGetHash(uint32_t hash, void *iface, uint32_t size);
-uintptr_t s3e_trampoline_dispatch(uint32_t index);
 int32_t s3eRegisterNoop(uint32_t id, void *callback, void *user_data);
 
 #endif

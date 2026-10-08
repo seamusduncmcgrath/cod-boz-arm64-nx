@@ -5,7 +5,6 @@ static size_t g_config_entry_count;
 static char g_multiplayer_server[128];
 static bool g_multiplayer_proxy;
 static bool g_voice_chat;
-static char g_player_name[14];
 
 static char *trim(char *text) {
     while (*text && isspace((unsigned char)*text)) {
@@ -51,27 +50,10 @@ static void parse_flag(const char *value, bool *out) {
     *out = parsed != 0;
 }
 
-static bool valid_player_name(const char *value) {
-    size_t length = strlen(value);
-    if (length == 0 || length >= sizeof(g_player_name)) {
-        return false;
-    }
-    for (size_t i = 0; i < length; ++i) {
-        unsigned char c = (unsigned char)value[i];
-        bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-        bool digit = c >= '0' && c <= '9';
-        if (!letter && !digit && c != ' ' && c != '-' && c != '_' && c != '.') {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void load_control_config(void) {
     g_multiplayer_server[0] = 0;
     g_multiplayer_proxy = false;
     g_voice_chat = false;
-    snprintf(g_player_name, sizeof(g_player_name), "Player");
 
     char path[1200];
     snprintf(path, sizeof(path), "%s/config.txt", g_root);
@@ -106,8 +88,6 @@ static void load_control_config(void) {
             parse_flag(value, &g_multiplayer_proxy);
         } else if (strcmp(key, "voice_chat") == 0) {
             parse_flag(value, &g_voice_chat);
-        } else if (strcmp(key, "player_name") == 0 && valid_player_name(value)) {
-            snprintf(g_player_name, sizeof(g_player_name), "%s", value);
         }
     }
     fclose(file);
@@ -115,10 +95,6 @@ static void load_control_config(void) {
     if (g_multiplayer_server[0] && g_multiplayer_proxy) {
         fprintf(stderr, "[multiplayer] proxy mode is not supported\n");
     }
-}
-
-const char *s3e_host_player_name(void) {
-    return g_player_name;
 }
 
 static bool multiplayer_server_enabled(void) {
@@ -291,10 +267,18 @@ static int parse_config_int_value(const char *value, int depth, int32_t *out) {
     return 1;
 }
 
-static int root_asset_exists(const char *name) {
-    char path[1200];
-    snprintf(path, sizeof(path), "%s/assets/%s", g_root, name);
-    return access(path, F_OK) == 0;
+/*
+ * Gives one of the game's memory buckets at least this size. The game's own app.icf asks for
+ * more than these, as its structures need, and what it asks for is kept.
+ */
+static void config_set_bucket_size(const char *section, const char *key, int32_t size) {
+    int32_t configured = 0;
+    if (parse_config_int_value(config_get(section, key), 0, &configured) && configured >= size) {
+        return;
+    }
+    char value[16];
+    snprintf(value, sizeof(value), "%d", size);
+    config_set(section, key, value);
 }
 
 void s3e_host_set_config(const uint8_t *data, uint32_t size) {
@@ -355,7 +339,7 @@ void s3e_host_set_config(const uint8_t *data, uint32_t size) {
     config_set("GAME", "VoiceChatEnabled", g_voice_chat ? "1" : "0");
     config_set("GAME", "LowEndDevice", "0");
     config_set("GAME", "LowMemoryDevice", "0");
-    config_set("GAME", "GuiBucketSize", "2500000");
+    config_set_bucket_size("GAME", "GuiBucketSize", 2500000);
     config_set("GAME", "FrontendMemoryWarningLevel", "0");
     if (multiplayer_server_enabled()) {
         config_set("GAME", "OnlineAccount", "GENERIC");
@@ -370,17 +354,9 @@ void s3e_host_set_config(const uint8_t *data, uint32_t size) {
         config_set("Demonware", "STUNServer", "");
         config_set("ONLINE", "dispatcher", "");
     }
-    config_set("FLASH", "FlashBucketSize", "32000000");
+    config_set_bucket_size("FLASH", "FlashBucketSize", 32000000);
     config_set("FLASH", "FlashBucketHeapAnalyse", "0");
-    if (root_asset_exists("blackops_etc.dz")) {
-        config_set("RESMANAGER", "ResBuildStyle", "etc");
-    } else if (root_asset_exists("blackops_atitc.dz")) {
-        config_set("RESMANAGER", "ResBuildStyle", "atitc");
-    } else if (root_asset_exists("blackops_dxt.dz")) {
-        config_set("RESMANAGER", "ResBuildStyle", "dxt");
-    } else {
-        config_set("RESMANAGER", "ResBuildStyle", "gles1");
-    }
+    config_set("RESMANAGER", "ResBuildStyle", "gles1");
 }
 
 int32_t s3eConfigGetInt(const char *section, const char *key, int32_t *out) {

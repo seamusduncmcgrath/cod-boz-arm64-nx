@@ -2,6 +2,10 @@
 
 #include <sys/stat.h>
 
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
 enum {
     DEVICE_ID_BYTE_COUNT = 16,
     DEVICE_ID_HEX_LENGTH = 32,
@@ -60,6 +64,10 @@ static bool load_bytes(const char *path, uint8_t bytes[DEVICE_ID_BYTE_COUNT]) {
 }
 
 static bool random_bytes(uint8_t bytes[DEVICE_ID_BYTE_COUNT]) {
+#ifdef __SWITCH__
+    randomGet(bytes, DEVICE_ID_BYTE_COUNT);
+    return true;
+#else
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return false;
@@ -67,6 +75,7 @@ static bool random_bytes(uint8_t bytes[DEVICE_ID_BYTE_COUNT]) {
     bool valid = read_all(fd, bytes, DEVICE_ID_BYTE_COUNT);
     close(fd);
     return valid;
+#endif
 }
 
 static bool store_bytes(const char *path, const char *root,
@@ -80,8 +89,13 @@ static bool store_bytes(const char *path, const char *root,
     if (fd < 0) {
         return false;
     }
+#ifdef __SWITCH__
+    /* The SD card's filesystem has no POSIX permissions to restrict. */
+    bool stored = write_all(fd, bytes, DEVICE_ID_BYTE_COUNT) && fsync(fd) == 0;
+#else
     bool stored =
         fchmod(fd, 0600) == 0 && write_all(fd, bytes, DEVICE_ID_BYTE_COUNT) && fsync(fd) == 0;
+#endif
     int close_result = close(fd);
     stored = stored && close_result == 0;
     if (stored) {

@@ -146,5 +146,16 @@ int64_t s3eTimerGetLocaltimeOffset(const uint64_t *utc_ms) {
     if (!localtime_r(&now, &local_tm)) {
         return 0;
     }
+#ifdef __SWITCH__
+    /* newlib's struct tm has no tm_gmtoff: read the UTC fields back as local time instead. */
+    struct tm utc_tm;
+    if (!gmtime_r(&now, &utc_tm)) {
+        return 0;
+    }
+    utc_tm.tm_isdst = local_tm.tm_isdst;
+    time_t shifted = mktime(&utc_tm);
+    return shifted == (time_t)-1 ? 0 : ((int64_t)now - (int64_t)shifted) * 1000;
+#else
     return (int64_t)local_tm.tm_gmtoff * 1000;
+#endif
 }

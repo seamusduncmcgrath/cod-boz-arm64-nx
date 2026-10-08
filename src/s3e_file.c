@@ -20,9 +20,9 @@ static int use_existing_path(char *out, size_t out_size, const char *path) {
     return 1;
 }
 
-static int try_asset_path(char *out, size_t out_size, const char *prefix, const char *name) {
+static int try_asset_path(char *out, size_t out_size, const char *name) {
     char path[1200];
-    snprintf(path, sizeof(path), "%s/%s/%s", g_root, prefix, name);
+    snprintf(path, sizeof(path), "%s/assets/%s", g_root, name);
     return use_existing_path(out, out_size, path);
 }
 
@@ -31,257 +31,13 @@ static const char *base_name(const char *name) {
     return slash ? slash + 1 : (name ? name : "");
 }
 
-static int flat_group_name(const char *name, char *out, size_t out_size) {
-    const char *slash = strchr(name ? name : "", '/');
-    if (!slash || !strstr(name, ".group.bin")) {
-        return 0;
-    }
-    size_t section_len = (size_t)(slash - name);
-    if (section_len == 0 || section_len >= 128) {
-        return 0;
-    }
-    char section[128];
-    memcpy(section, name, section_len);
-    section[section_len] = 0;
-    const char *leaf = strrchr(name, '/') + 1;
-    if (strcmp(leaf, ".group.bin") == 0) {
-        snprintf(out, out_size, "%s.group.bin", section);
-    } else {
-        snprintf(out, out_size, "%s", leaf);
-    }
-    return 1;
-}
-
-static uint16_t read_le16(const uint8_t *data) {
-    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
-
-static uint32_t read_le32(const uint8_t *data) {
-    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
-           ((uint32_t)data[3] << 24);
-}
-
-static void lower_copy(char *out, size_t out_size, const char *in) {
-    size_t i = 0;
-    if (!out_size) {
-        return;
-    }
-    for (; in && in[i] && i + 1 < out_size; ++i) {
-        out[i] = (char)tolower((unsigned char)in[i]);
-    }
-    out[i] = 0;
-}
-
-static int read_c_string(FILE *file, char *out, size_t out_size) {
-    size_t len = 0;
-    int ch;
-    while ((ch = fgetc(file)) != EOF) {
-        if (ch == 0) {
-            if (out_size) {
-                out[len < out_size ? len : out_size - 1] = 0;
-            }
-            return 1;
-        }
-        if (len + 1 < out_size) {
-            out[len++] = (char)ch;
-        }
-    }
-    if (out_size) {
-        out[len < out_size ? len : out_size - 1] = 0;
-    }
-    return 0;
-}
-
-static int dtrz_load_index(void) {
-    if (g_dtrz.loaded) {
-        return g_dtrz.count > 0;
-    }
-    g_dtrz.loaded = 1;
-    static const char *archives[] = {
-        "blackops_etc.dz",
-        "blackops_atitc.dz",
-        "blackops_dxt.dz",
-        "blackops_gles1.dz",
-    };
-    for (size_t i = 0; i < sizeof(archives) / sizeof(archives[0]); ++i) {
-        char candidate[sizeof(g_dtrz.path)];
-        snprintf(candidate, sizeof(candidate), "%s/assets/%s", g_root, archives[i]);
-        if (path_exists(candidate)) {
-            snprintf(g_dtrz.path, sizeof(g_dtrz.path), "%s", candidate);
-            break;
-        }
-    }
-    if (!g_dtrz.path[0]) {
-        snprintf(g_dtrz.path, sizeof(g_dtrz.path), "%s/assets/blackops_gles1.dz", g_root);
-    }
-
-    FILE *file = fopen(g_dtrz.path, "rb");
-    if (!file) {
-        return 0;
-    }
-    uint8_t header[9];
-    if (fread(header, 1, sizeof(header), file) != sizeof(header) ||
-        memcmp(header, "DTRZ", 4) != 0) {
-        fclose(file);
-        return 0;
-    }
-    uint16_t file_count = read_le16(header + 4);
-    uint16_t group_count = read_le16(header + 6);
-    if (group_count > 0) {
-        group_count--;
-    }
-    if (file_count > DTRZ_MAX_ENTRIES) {
-        fclose(file);
-        return 0;
-    }
-    for (uint16_t i = 0; i < file_count; ++i) {
-        if (!read_c_string(file, g_dtrz.entries[i].name, sizeof(g_dtrz.entries[i].name))) {
-            fclose(file);
-            return 0;
-        }
-    }
-    char scratch[DTRZ_NAME_MAX];
-    for (uint16_t i = 0; i < group_count; ++i) {
-        if (!read_c_string(file, scratch, sizeof(scratch))) {
-            fclose(file);
-            return 0;
-        }
-    }
-    uint8_t marker[4];
-    if (fread(marker, 1, sizeof(marker), file) != sizeof(marker) || read_le32(marker) != 1 ||
-        fseek(file, (long)file_count * 6L, SEEK_CUR) != 0) {
-        fclose(file);
-        return 0;
-    }
-    for (uint16_t i = 0; i < file_count; ++i) {
-        uint8_t record[16];
-        if (fread(record, 1, sizeof(record), file) != sizeof(record)) {
-            fclose(file);
-            return 0;
-        }
-        struct dtrz_entry *entry = &g_dtrz.entries[i];
-        entry->offset = read_le32(record);
-        entry->size = read_le32(record + 4);
-        lower_copy(entry->lower_name, sizeof(entry->lower_name), entry->name);
-        lower_copy(entry->lower_base, sizeof(entry->lower_base), base_name(entry->name));
-    }
-    g_dtrz.count = file_count;
-    fclose(file);
-    return 1;
-}
-
-static int dtrz_archive_redirect_path(const char *name, char *out, size_t out_size) {
-    const char *requested = base_name(name ? name : "");
-    if (strcasecmp(requested, "blackops_gles1.dz") != 0) {
-        return 0;
-    }
-    if (!dtrz_load_index() || !g_dtrz.path[0]) {
-        return 0;
-    }
-    const char *selected = base_name(g_dtrz.path);
-    if (strcasecmp(selected, requested) == 0 || !path_exists(g_dtrz.path)) {
-        return 0;
-    }
-    snprintf(out, out_size, "%s", g_dtrz.path);
-    return 1;
-}
-
-static const struct dtrz_entry *dtrz_find_entry(const char *name) {
-    if (!dtrz_load_index()) {
-        return NULL;
-    }
-    char lower_name[DTRZ_NAME_MAX];
-    lower_copy(lower_name, sizeof(lower_name), name ? name : "");
-    const char *lower_base = base_name(lower_name);
-    for (size_t i = 0; i < g_dtrz.count; ++i) {
-        const struct dtrz_entry *entry = &g_dtrz.entries[i];
-        if (strcmp(entry->lower_name, lower_name) == 0 ||
-            strcmp(entry->lower_base, lower_base) == 0) {
-            return entry;
-        }
-    }
-    return NULL;
-}
-
-static int dtrz_entry_exists(const char *name) {
-    return dtrz_find_entry(name) != NULL;
-}
-
-static int dtrz_prefer_entry(const char *name) {
-    char lower[256];
-    lower_copy(lower, sizeof(lower), name ? name : "");
-    return strncmp(lower, "data-etc/", 9) == 0 || strncmp(lower, "data-dxt/", 9) == 0 ||
-           strncmp(lower, "data-atitc/", 11) == 0;
-}
-
-static void track_memory_file(FILE *file, void *buffer) {
-    struct memory_file *item = malloc(sizeof(*item));
-    if (!item) {
-        fclose(file);
-        free(buffer);
-        return;
-    }
-    item->file = file;
-    item->buffer = buffer;
-    item->next = g_memory_files;
-    g_memory_files = item;
-}
-
-static int close_memory_file(FILE *file) {
-    struct memory_file **link = &g_memory_files;
-    while (*link) {
-        struct memory_file *item = *link;
-        if (item->file == file) {
-            *link = item->next;
-            fclose(item->file);
-            free(item->buffer);
-            free(item);
-            return 1;
-        }
-        link = &item->next;
-    }
-    return 0;
-}
-
-static FILE *open_dtrz_entry(const char *name, char *opened_path, size_t opened_path_size) {
-    const struct dtrz_entry *entry = dtrz_find_entry(name);
-    if (!entry) {
-        return NULL;
-    }
-    FILE *archive = fopen(g_dtrz.path, "rb");
-    if (!archive) {
-        return NULL;
-    }
-    size_t alloc_size = entry->size ? entry->size : 1;
-    void *buffer = malloc(alloc_size);
-    if (!buffer) {
-        fclose(archive);
-        return NULL;
-    }
-    if (fseek(archive, (long)entry->offset, SEEK_SET) != 0 ||
-        fread(buffer, 1, entry->size, archive) != entry->size) {
-        fclose(archive);
-        free(buffer);
-        return NULL;
-    }
-    fclose(archive);
-    codboz_hide_virtual_stick_artwork(entry->name, buffer, entry->size);
-    FILE *file = fmemopen(buffer, alloc_size, "rb");
-    if (!file) {
-        free(buffer);
-        return NULL;
-    }
-    track_memory_file(file, buffer);
-    snprintf(opened_path, opened_path_size, "DTRZ:%s", entry->name);
-    return file;
-}
-
+/*
+ * Where a file the game reads from storage is: in the port's folder, or in the assets folder
+ * under its own name or under the last part of it.
+ */
 static int resolve_read_path(const char *name, char *out, size_t out_size) {
     char path[1200];
     const char *safe_name = name ? name : "";
-    if (dtrz_archive_redirect_path(safe_name, out, out_size)) {
-        return 1;
-    }
     make_path(path, sizeof(path), safe_name);
     if (use_existing_path(out, out_size, path)) {
         return 1;
@@ -289,33 +45,15 @@ static int resolve_read_path(const char *name, char *out, size_t out_size) {
     if (safe_name[0] == '/') {
         return 0;
     }
-    if (try_asset_path(out, out_size, "assets", safe_name) ||
-        try_asset_path(out, out_size, "assets/data-gles1", safe_name) ||
-        try_asset_path(out, out_size, "assets/data-sw", safe_name)) {
-        return 1;
-    }
-    char flat_name[512];
-    if (flat_group_name(safe_name, flat_name, sizeof(flat_name)) &&
-        (try_asset_path(out, out_size, "assets/data-gles1", flat_name) ||
-         try_asset_path(out, out_size, "assets/data-sw", flat_name) ||
-         try_asset_path(out, out_size, "assets", flat_name))) {
+    if (try_asset_path(out, out_size, safe_name)) {
         return 1;
     }
     const char *leaf = base_name(safe_name);
-    if (leaf != safe_name && (try_asset_path(out, out_size, "assets/data-gles1", leaf) ||
-                              try_asset_path(out, out_size, "assets/data-sw", leaf) ||
-                              try_asset_path(out, out_size, "assets", leaf))) {
-        return 1;
-    }
-    return 0;
+    return leaf != safe_name && try_asset_path(out, out_size, leaf);
 }
 
 static int is_read_mode(const char *mode) {
     return mode && mode[0] == 'r';
-}
-
-static int is_archive_read_mode(const char *mode) {
-    return is_read_mode(mode) && strchr(mode, '+') == NULL;
 }
 
 static int is_user_file_mode(const char *mode) {
@@ -408,9 +146,151 @@ static long file_size_for_seek(FILE *file) {
     return size;
 }
 
+/*
+ * User file systems. The game registers callback tables and expects every read-mode open to be
+ * offered to them before real storage is tried. Its archive code relies on this to serve, and
+ * decompress, the files inside blackops_gles1.dz. The table layout was read out of the game.
+ */
+struct user_file_system {
+    void *(*open)(const char *name, const char *mode);
+    uint32_t (*read)(void *buffer, uint32_t elem_size, uint32_t count, void *handle);
+    uint8_t (*eof)(void *handle);
+    int32_t (*seek)(void *handle, int32_t offset, int32_t origin);
+    int32_t (*tell)(void *handle);
+    int32_t (*close)(void *handle);
+    void *(*list_directory)(const char *path);
+    int32_t (*list_next)(void *list, char *name, int32_t length);
+    int32_t (*list_close)(void *list);
+};
+
+/* What s3eFileOpen returns for a file that a user file system is serving. */
+struct user_file {
+    const struct user_file_system *file_system;
+    void *handle;
+    struct user_file *next;
+};
+
+enum { USER_FILE_SYSTEM_MAX = 8 };
+
+static struct user_file_system g_user_file_systems[USER_FILE_SYSTEM_MAX];
+static size_t g_user_file_system_count;
+static struct user_file *g_user_files;
+
+static struct user_file *find_user_file(void *file) {
+    for (struct user_file *item = g_user_files; item; item = item->next) {
+        if (item == file) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * The game asks for names such as "bootstrap//iwui_style/style.group.bin", while its archive
+ * code matches folder names exactly and only knows the single-separator form. So the name is
+ * tidied before a file system sees it: one kind of separator, no repeats, no leading "./".
+ */
+static void clean_user_file_name(const char *name, char *out, size_t out_size) {
+    size_t length = 0;
+    if (name[0] == '.' && (name[1] == '/' || name[1] == '\\')) {
+        name += 2;
+    }
+    for (; *name && length + 1 < out_size; ++name) {
+        char c = *name == '\\' ? '/' : *name;
+        /* Keep the "//" of a drive prefix such as "raw://". */
+        int after_drive = length >= 2 && out[length - 2] == ':';
+        if (c == '/' && length && out[length - 1] == '/' && !after_drive) {
+            continue;
+        }
+        out[length++] = c;
+    }
+    out[length] = 0;
+}
+
+static void *open_user_file(const char *requested_name, const char *mode) {
+    char name[1200];
+    clean_user_file_name(requested_name, name, sizeof(name));
+    for (size_t i = g_user_file_system_count; i-- > 0;) {
+        const struct user_file_system *file_system = &g_user_file_systems[i];
+        void *handle = file_system->open ? file_system->open(name, mode) : NULL;
+        if (!handle) {
+            continue;
+        }
+        struct user_file *file = malloc(sizeof(*file));
+        if (!file) {
+            if (file_system->close) {
+                file_system->close(handle);
+            }
+            return NULL;
+        }
+        file->file_system = file_system;
+        file->handle = handle;
+        file->next = g_user_files;
+        g_user_files = file;
+        return file;
+    }
+    return NULL;
+}
+
+static int32_t close_user_file(struct user_file *file) {
+    struct user_file **link = &g_user_files;
+    while (*link && *link != file) {
+        link = &(*link)->next;
+    }
+    if (*link) {
+        *link = file->next;
+    }
+    int32_t result = file->file_system->close ? file->file_system->close(file->handle) : 0;
+    free(file);
+    return result;
+}
+
+static uint32_t read_user_file(struct user_file *file, void *buffer, uint32_t elem_size,
+                               uint32_t count) {
+    return file->file_system->read ? file->file_system->read(buffer, elem_size, count, file->handle)
+                                   : 0;
+}
+
+static int32_t seek_user_file(struct user_file *file, int32_t offset, int32_t origin) {
+    return file->file_system->seek ? file->file_system->seek(file->handle, offset, origin) : -1;
+}
+
+static int32_t tell_user_file(struct user_file *file) {
+    return file->file_system->tell ? file->file_system->tell(file->handle) : -1;
+}
+
+static int32_t user_file_size(struct user_file *file) {
+    int32_t here = tell_user_file(file);
+    if (here < 0 || seek_user_file(file, 0, SEEK_END) != 0) {
+        return -1;
+    }
+    int32_t size = tell_user_file(file);
+    seek_user_file(file, here, SEEK_SET);
+    return size;
+}
+
+/* Names the game asked for and did not get; capped so a per-frame probe cannot flood the log. */
+static void log_missing_file(const char *name) {
+    static unsigned reported;
+    if (reported < 200) {
+        reported++;
+        fprintf(stderr, "[file] not found: %s\n", name);
+    }
+}
+
+/* Horizon has no /dev/null, so a zero-length file is kept in the port's folder instead. */
+static FILE *open_empty_file(void) {
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/.empty", g_root);
+    FILE *file = fopen(path, "wb");
+    if (file) {
+        fclose(file);
+    }
+    return fopen(path, "rb");
+}
+
 void *s3eFileOpen(const char *name, const char *mode) {
     char path[1200];
-    char opened_path[1200] = "";
     const char *safe_name = name ? name : "";
     const char *safe_mode = mode ? mode : "rb";
     char fopen_mode[16];
@@ -426,11 +306,8 @@ void *s3eFileOpen(const char *name, const char *mode) {
             copy_file(seed_path, path);
         }
         file = fopen(path, fopen_mode);
-        if (file) {
-            snprintf(opened_path, sizeof(opened_path), "%s", path);
-        }
-    } else if (is_archive_read_mode(safe_mode) && dtrz_prefer_entry(safe_name) &&
-               (file = open_dtrz_entry(safe_name, opened_path, sizeof(opened_path))) != NULL) {
+    } else if (is_read_mode(safe_mode) && (file = open_user_file(safe_name, safe_mode)) != NULL) {
+        return file;
     } else if (is_read_mode(safe_mode) && resolve_read_path(safe_name, path, sizeof(path))) {
         file = fopen(path, fopen_mode);
     } else {
@@ -440,18 +317,15 @@ void *s3eFileOpen(const char *name, const char *mode) {
         }
         file = fopen(path, fopen_mode);
     }
-    if (file && !opened_path[0]) {
-        snprintf(opened_path, sizeof(opened_path), "%s", path);
-    }
     if (!file && is_read_mode(safe_mode) && safe_name[0] != '/') {
         snprintf(path, sizeof(path), "%s/assets/%s", g_root, safe_name);
         file = fopen(path, fopen_mode);
     }
-    if (!file && is_archive_read_mode(safe_mode)) {
-        file = open_dtrz_entry(safe_name, opened_path, sizeof(opened_path));
-    }
     if (!file && is_read_mode(safe_mode) && strcmp(base_name(safe_name), "console.bin") == 0) {
-        file = fopen("/dev/null", "rb");
+        file = open_empty_file();
+    }
+    if (!file && is_read_mode(safe_mode)) {
+        log_missing_file(safe_name);
     }
     return file;
 }
@@ -460,41 +334,72 @@ int32_t s3eFileClose(void *file) {
     if (!file) {
         return -1;
     }
-    if (close_memory_file((FILE *)file)) {
-        return 0;
+    struct user_file *user_file = find_user_file(file);
+    if (user_file) {
+        return close_user_file(user_file);
     }
     return fclose((FILE *)file);
 }
 
 uint32_t s3eFileRead(void *buffer, uint32_t elem_size, uint32_t count, void *file) {
+    struct user_file *user_file = find_user_file(file);
+    if (user_file) {
+        return read_user_file(user_file, buffer, elem_size, count);
+    }
     return file ? (uint32_t)fread(buffer, elem_size, count, (FILE *)file) : 0;
 }
 
 uint32_t s3eFileWrite(const void *buffer, uint32_t elem_size, uint32_t count, void *file) {
+    if (find_user_file(file)) {
+        return 0;
+    }
     return file ? (uint32_t)fwrite(buffer, elem_size, count, (FILE *)file) : 0;
 }
 
 int32_t s3eFileGetChar(void *file) {
+    struct user_file *user_file = find_user_file(file);
+    if (user_file) {
+        uint8_t value;
+        return read_user_file(user_file, &value, 1, 1) == 1 ? value : -1;
+    }
     return file ? fgetc((FILE *)file) : -1;
 }
 
 int32_t s3eFilePutChar(int32_t c, void *file) {
+    if (find_user_file(file)) {
+        return -1;
+    }
     return file ? fputc(c, (FILE *)file) : -1;
 }
 
 int32_t s3eFileFlush(void *file) {
+    if (find_user_file(file)) {
+        return 0;
+    }
     return file ? fflush((FILE *)file) : -1;
 }
 
 int32_t s3eFileSeek(void *file, int32_t offset, int32_t origin) {
+    struct user_file *user_file = find_user_file(file);
+    if (user_file) {
+        return seek_user_file(user_file, offset, origin);
+    }
     return file ? fseek((FILE *)file, offset, origin) : -1;
 }
 
 int32_t s3eFileTell(void *file) {
+    struct user_file *user_file = find_user_file(file);
+    if (user_file) {
+        return tell_user_file(user_file);
+    }
     return file ? (int32_t)ftell((FILE *)file) : -1;
 }
 
 int32_t s3eFileGetSize(void *file) {
+    struct user_file *user_file = find_user_file(file);
+    if (user_file) {
+        return user_file_size(user_file);
+    }
     return file ? (int32_t)file_size_for_seek((FILE *)file) : -1;
 }
 
@@ -505,17 +410,17 @@ int32_t s3eFileCheckExists(const char *name) {
         make_user_path(path, sizeof(path), safe_name);
         return access(path, F_OK) == 0 ? 1 : 0;
     }
-    if (dtrz_prefer_entry(safe_name) && dtrz_entry_exists(safe_name)) {
+    /* User file systems have no existence query, so a file exists if one of them can open it. */
+    struct user_file *user_file = open_user_file(safe_name, "rb");
+    if (user_file) {
+        close_user_file(user_file);
         return 1;
     }
     if (resolve_read_path(safe_name, path, sizeof(path))) {
         return 1;
     }
     snprintf(path, sizeof(path), "%s/assets/%s", g_root, safe_name);
-    if (access(path, F_OK) == 0) {
-        return 1;
-    }
-    return dtrz_entry_exists(safe_name) ? 1 : 0;
+    return access(path, F_OK) == 0 ? 1 : 0;
 }
 
 int32_t s3eFileGetError(void) {
@@ -556,9 +461,13 @@ int32_t s3eFileRename(const char *old_name, const char *new_name) {
     return rename(old_path, new_path);
 }
 
-int32_t s3eFileAddUserFileSys(const char *prefix, const char *path) {
-    (void)prefix;
-    (void)path;
+int32_t s3eFileAddUserFileSys(const void *file_system) {
+    if (!file_system || g_user_file_system_count >= USER_FILE_SYSTEM_MAX) {
+        return 1;
+    }
+    /* The caller's table lives on its stack, and only these entries are always filled in. */
+    memcpy(&g_user_file_systems[g_user_file_system_count++], file_system,
+           sizeof(struct user_file_system));
     return 0;
 }
 

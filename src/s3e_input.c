@@ -6,6 +6,7 @@ enum {
     SDL_INIT_JOYSTICK = 0x00000200u,
     SDL_INIT_GAMECONTROLLER = 0x00002000u,
     SDL_FIRSTEVENT = 0,
+    SDL_QUIT = 0x100,
     SDL_LASTEVENT = 0xffff,
 };
 
@@ -16,6 +17,8 @@ enum {
     SDL_BUTTON_Y = 3,
     SDL_BUTTON_BACK = 4,
     SDL_BUTTON_START = 6,
+    SDL_BUTTON_LEFTSTICK = 7,
+    SDL_BUTTON_RIGHTSTICK = 8,
     SDL_BUTTON_LEFTSHOULDER = 9,
     SDL_BUTTON_RIGHTSHOULDER = 10,
     SDL_BUTTON_DPAD_UP = 11,
@@ -97,6 +100,10 @@ enum {
     XPERIA_AXIS_DEADZONE = 6000,
     TRIGGER_PRESS_THRESHOLD = 16384,
     TRIGGER_RELEASE_THRESHOLD = 12288,
+    /* The game's own UILongClickTime. */
+    STANCE_LONG_PRESS_MS = 500,
+    /* Longer than a tap to reload, and short enough not to feel like waiting. */
+    USE_HOLD_MS = 300,
 };
 
 enum trigger_id {
@@ -110,16 +117,55 @@ enum {
     S3E_TOUCHPAD_PRESSED = 1,
 };
 
+enum hud_button_id {
+    HUD_BUTTON_RELOAD,
+    HUD_BUTTON_CHANGE_WEAPON,
+    HUD_BUTTON_GRENADE,
+    HUD_BUTTON_FIRE,
+    HUD_BUTTON_CROUCH,
+    HUD_BUTTON_PRONE,
+    HUD_BUTTON_ACTION,
+    HUD_BUTTON_SPRINT,
+    HUD_BUTTON_COUNT,
+};
+
 struct key_map {
     const uint32_t *keys;
     size_t key_count;
+};
+
+/*
+ * A controller button wired to the game's handlers for one of its on-screen buttons instead of
+ * to a key. The game hears of it in s3eKeyboardUpdate, which is where key presses reach it too.
+ * One that repeats is pressed again on every update for as long as it is held.
+ */
+struct hud_button {
+    void (*press)(void);
+    void (*release)(void);
+    uint8_t repeat;
+    uint8_t down;
+    uint8_t pressed;
+    uint8_t held;
+};
+
+/* SDL_Finger: a position from 0 to 1 across the window. */
+struct sdl_finger {
+    int64_t id;
+    float x;
+    float y;
+    float pressure;
 };
 
 struct sdl_input_api {
     int (*InitSubSystem)(uint32_t flags);
     void (*QuitSubSystem)(uint32_t flags);
     void (*PumpEvents)(void);
+    int (*HasEvent)(uint32_t type);
     void (*FlushEvents)(uint32_t min_type, uint32_t max_type);
+    int (*GetNumTouchDevices)(void);
+    int64_t (*GetTouchDevice)(int index);
+    int (*GetNumTouchFingers)(int64_t touch_id);
+    const struct sdl_finger *(*GetTouchFinger)(int64_t touch_id, int index);
     int (*NumJoysticks)(void);
     int (*IsGameController)(int joystick_index);
     const char *(*JoystickNameForIndex)(int joystick_index);
@@ -178,6 +224,17 @@ static uint64_t g_controller_scan_ms;
 static int g_last_joystick_count = -1;
 static uint8_t g_hat_mask;
 static uint8_t g_trigger_down[TRIGGER_COUNT];
+static struct hud_button g_hud_buttons[HUD_BUTTON_COUNT];
+static void (*g_frame_handler)(void);
+static uint64_t g_stance_down_ms;
+static uint8_t g_stance_down;
+static uint8_t g_stance_prone;
+static uint64_t g_use_down_ms;
+static uint8_t g_use_down;
+static uint8_t g_sprint;
+static uint8_t g_sprint_click;
+static int g_touchscreen;
+static int g_touch_down;
 
 static uint8_t g_keyboard_live[KEYBOARD_KEY_COUNT];
 static uint8_t g_keyboard_published[KEYBOARD_KEY_COUNT];
@@ -254,7 +311,12 @@ static void input_open(void) {
     ok &= sdl_load_symbol((void **)&g_sdl.InitSubSystem, "SDL_InitSubSystem");
     ok &= sdl_load_symbol((void **)&g_sdl.QuitSubSystem, "SDL_QuitSubSystem");
     ok &= sdl_load_symbol((void **)&g_sdl.PumpEvents, "SDL_PumpEvents");
+    sdl_load_optional_symbol((void **)&g_sdl.HasEvent, "SDL_HasEvent");
     ok &= sdl_load_symbol((void **)&g_sdl.FlushEvents, "SDL_FlushEvents");
+    sdl_load_optional_symbol((void **)&g_sdl.GetNumTouchDevices, "SDL_GetNumTouchDevices");
+    sdl_load_optional_symbol((void **)&g_sdl.GetTouchDevice, "SDL_GetTouchDevice");
+    sdl_load_optional_symbol((void **)&g_sdl.GetNumTouchFingers, "SDL_GetNumTouchFingers");
+    sdl_load_optional_symbol((void **)&g_sdl.GetTouchFinger, "SDL_GetTouchFinger");
     ok &= sdl_load_symbol((void **)&g_sdl.NumJoysticks, "SDL_NumJoysticks");
     ok &= sdl_load_symbol((void **)&g_sdl.IsGameController, "SDL_IsGameController");
     sdl_load_optional_symbol((void **)&g_sdl.JoystickNameForIndex, "SDL_JoystickNameForIndex");
@@ -469,6 +531,51 @@ static void input_release_pointer(void) {
     }
 }
 
+/*
+ * A touchscreen is the pointer: the first finger down presses where it lands and drags with it.
+ * Returns whether there is a touchscreen at all.
+ */
+static int input_update_touch(void) {
+    if (!g_sdl.GetNumTouchDevices || !g_sdl.GetTouchDevice || !g_sdl.GetNumTouchFingers ||
+        !g_sdl.GetTouchFinger) {
+        return 0;
+    }
+
+    int devices = g_sdl.GetNumTouchDevices();
+    const struct sdl_finger *finger = NULL;
+    for (int i = 0; i < devices && !finger; ++i) {
+        int64_t device = g_sdl.GetTouchDevice(i);
+        if (g_sdl.GetNumTouchFingers(device) > 0) {
+            finger = g_sdl.GetTouchFinger(device, 0);
+        }
+    }
+
+    if (!finger) {
+        if (g_touch_down) {
+            g_touch_down = 0;
+            input_release_pointer();
+        }
+        return devices > 0;
+    }
+
+    /* Fingers are placed on the window, the pointer on the game's surface within it. */
+    int32_t x = clamp_pointer_x((int32_t)(finger->x * g_native_window.width) - g_surface.x);
+    int32_t y = clamp_pointer_y((int32_t)(finger->y * g_native_window.height) - g_surface.y);
+    if (x != g_pointer_x || y != g_pointer_y) {
+        g_pointer_x = x;
+        g_pointer_y = y;
+        pointer_dispatch_motion();
+    }
+    if (!g_touch_down) {
+        g_touch_down = 1;
+        if (!g_pointer_down) {
+            pointer_set_down(1);
+            pointer_dispatch_button(0, 1);
+        }
+    }
+    return 1;
+}
+
 static void keyboard_dispatch_event(uint32_t key, int32_t pressed) {
     struct s3e_keyboard_event event = {
         .key = (int32_t)key,
@@ -550,12 +657,55 @@ static void game_action_apply(int down, const struct key_map *keys) {
     keyboard_set_keys(keys->keys, keys->key_count, down, 1);
 }
 
+static void hud_button_apply(int down, enum hud_button_id id, const struct key_map *keys) {
+    struct hud_button *button = &g_hud_buttons[id];
+    if (!button->press) {
+        game_action_apply(down, keys);
+        return;
+    }
+    if (down && !button->down) {
+        button->pressed = 1;
+    }
+    button->down = down ? 1 : 0;
+}
+
+/* One step per update, so a tap shorter than a frame still arrives as a press, then a release. */
+static void hud_buttons_deliver(void) {
+    for (size_t i = 0; i < ARRAY_SIZE(g_hud_buttons); ++i) {
+        struct hud_button *button = &g_hud_buttons[i];
+        if (button->repeat) {
+            if (button->down || button->pressed) {
+                button->pressed = 0;
+                button->press();
+            }
+        } else if (button->held) {
+            if (!button->down || button->pressed) {
+                button->held = 0;
+                if (button->release) {
+                    button->release();
+                }
+            }
+        } else if (button->pressed) {
+            button->pressed = 0;
+            button->held = 1;
+            button->press();
+        }
+    }
+}
+
 static void keyboard_release_all(void) {
     for (uint32_t key = 0; key < KEYBOARD_KEY_COUNT; ++key) {
         if (g_keyboard_live[key] & KEY_STATE_DOWN) {
             keyboard_set_key(key, 0, 1);
         }
     }
+    for (size_t i = 0; i < ARRAY_SIZE(g_hud_buttons); ++i) {
+        g_hud_buttons[i].down = 0;
+        g_hud_buttons[i].pressed = 0;
+    }
+    g_stance_down = 0;
+    g_use_down = 0;
+    g_sprint = 0;
 }
 
 static void input_reset_triggers(void) {
@@ -670,24 +820,109 @@ static void input_update_cursor(uint64_t dt) {
     g_prev_a = a;
 }
 
-static void input_update_game_keys(void) {
-    g_prev_a = input_button(SDL_BUTTON_A);
+/*
+ * Where the game takes crouch and prone directly, one button gives both: a short press crouches
+ * once it is let go, and a long one goes prone instead.
+ */
+static void input_update_stance(int down, uint64_t now) {
+    if (!g_hud_buttons[HUD_BUTTON_CROUCH].press || !g_hud_buttons[HUD_BUTTON_PRONE].press) {
+        game_action_apply(down, &KEYMAP_CROUCH);
+        return;
+    }
 
-    game_action_apply(input_button(SDL_BUTTON_A), &KEYMAP_ACTION);
-    game_action_apply(input_button(SDL_BUTTON_B), &KEYMAP_RELOAD);
-    game_action_apply(input_button(SDL_BUTTON_X), &KEYMAP_MELEE);
-    game_action_apply(input_button(SDL_BUTTON_Y), &KEYMAP_GRENADE);
-    game_action_apply(input_button(SDL_BUTTON_LEFTSHOULDER) ||
-                          input_trigger(SDL_AXIS_TRIGGERLEFT, TRIGGER_LEFT),
-                      &KEYMAP_AIM);
-    game_action_apply(input_button(SDL_BUTTON_RIGHTSHOULDER) ||
-                          input_trigger(SDL_AXIS_TRIGGERRIGHT, TRIGGER_RIGHT),
-                      &KEYMAP_SHOOT);
+    if (!down) {
+        if (g_stance_down && !g_stance_prone) {
+            g_hud_buttons[HUD_BUTTON_CROUCH].pressed = 1;
+        }
+    } else if (!g_stance_down) {
+        g_stance_down_ms = now;
+        g_stance_prone = 0;
+    } else if (!g_stance_prone && now - g_stance_down_ms >= STANCE_LONG_PRESS_MS) {
+        g_stance_prone = 1;
+        g_hud_buttons[HUD_BUTTON_PRONE].pressed = 1;
+    }
+    g_stance_down = down ? 1 : 0;
+}
+
+/*
+ * The reload button also uses whatever the player is standing at once it has been held a while,
+ * as on the consoles; a tap only reloads.
+ */
+static int input_use_held(int down, uint64_t now) {
+    if (!down) {
+        g_use_down = 0;
+        return 0;
+    }
+    if (!g_use_down) {
+        g_use_down = 1;
+        g_use_down_ms = now;
+    }
+    return now - g_use_down_ms >= USE_HOLD_MS;
+}
+
+/*
+ * Sprinting starts with a click of the left stick while it is pushed, and is not held: it lasts
+ * until the stick is let go or something interrupts it. The game makes a tired player stop
+ * asking to sprint before they may again, so a click while sprinting is to stop and ask afresh.
+ * Returns whether this was such a click.
+ */
+static int input_update_sprint(int interrupted) {
+    int click = input_button(SDL_BUTTON_LEFTSTICK);
+    int clicked = click && !g_sprint_click;
+    int again = 0;
+    g_sprint_click = click ? 1 : 0;
+    if (interrupted ||
+        (!input_xperia_axis(SDL_AXIS_LEFTX) && !input_xperia_axis(SDL_AXIS_LEFTY))) {
+        g_sprint = 0;
+    } else if (clicked) {
+        again = g_sprint;
+        g_sprint = 1;
+    }
+    return again;
+}
+
+/*
+ * The game has one key for using things and sprinting. Where it takes each directly they have
+ * a button apiece; otherwise the key is down for either.
+ */
+static void input_update_action(int use, int sprint_again) {
+    struct hud_button *sprint = &g_hud_buttons[HUD_BUTTON_SPRINT];
+    if (!g_hud_buttons[HUD_BUTTON_ACTION].press || !sprint->press || !sprint->release) {
+        game_action_apply(use || g_sprint, &KEYMAP_ACTION);
+        return;
+    }
+
+    hud_button_apply(use, HUD_BUTTON_ACTION, &KEYMAP_ACTION);
+    hud_button_apply(g_sprint, HUD_BUTTON_SPRINT, &KEYMAP_ACTION);
+    if (sprint_again) {
+        sprint->pressed = 1;
+    }
+}
+
+/*
+ * Laid out as the game is on a console's controller, by where each button sits: the bottom
+ * face button, which jumps there, uses things here, as this game has no jump.
+ */
+static void input_update_game_keys(uint64_t now) {
+    int aim = input_trigger(SDL_AXIS_TRIGGERLEFT, TRIGGER_LEFT);
+    int fire = input_trigger(SDL_AXIS_TRIGGERRIGHT, TRIGGER_RIGHT);
+    int reload = input_button(SDL_BUTTON_X);
+    int use = input_button(SDL_BUTTON_A);
+    int use_held = input_use_held(reload, now);
+    int sprint_again = input_update_sprint(aim || fire);
+    g_prev_a = use;
+
+    input_update_action(use || use_held, sprint_again);
+    hud_button_apply(reload, HUD_BUTTON_RELOAD, &KEYMAP_RELOAD);
+    input_update_stance(input_button(SDL_BUTTON_B), now);
+    hud_button_apply(input_button(SDL_BUTTON_Y), HUD_BUTTON_CHANGE_WEAPON, &KEYMAP_CHANGE_WEAPON);
+    game_action_apply(aim, &KEYMAP_AIM);
+    hud_button_apply(fire, HUD_BUTTON_FIRE, &KEYMAP_SHOOT);
+    game_action_apply(input_button(SDL_BUTTON_LEFTSHOULDER), &KEYMAP_TACTICAL);
+    hud_button_apply(input_button(SDL_BUTTON_RIGHTSHOULDER), HUD_BUTTON_GRENADE, &KEYMAP_GRENADE);
+    game_action_apply(input_button(SDL_BUTTON_RIGHTSTICK), &KEYMAP_MELEE);
     game_action_apply(input_button(SDL_BUTTON_START), &KEYMAP_START);
-    game_action_apply(input_dpad_up(), &KEYMAP_TACTICAL);
-    game_action_apply(input_dpad_down(), &KEYMAP_CROUCH);
     game_action_apply(input_dpad_left(), &KEYMAP_ALT_FIRE);
-    game_action_apply(input_dpad_right(), &KEYMAP_CHANGE_WEAPON);
 }
 
 static void input_update_game_touchpads(void) {
@@ -702,12 +937,15 @@ static void input_update_game_touchpads(void) {
 }
 
 static void input_close_controller(void) {
-    input_release_pointer();
+    if (!g_touch_down) {
+        input_release_pointer();
+    }
     touchpad_release_all();
     keyboard_release_all();
     input_reset_triggers();
     g_prev_select = 0;
     g_prev_a = 0;
+    g_sprint_click = 0;
     g_input_last_ms = 0;
     g_hat_mask = 0;
 
@@ -733,6 +971,22 @@ static void input_refresh_controller(uint64_t now) {
     }
 }
 
+/*
+ * With a touchscreen the stick-driven cursor is not needed to get through the menus, so play
+ * starts with the gameplay controls. The cursor stays a button press away for when the screen
+ * is out of reach.
+ */
+static void input_refresh_touchscreen(void) {
+    int touchscreen = input_update_touch();
+    if (touchscreen && !g_touchscreen) {
+        if (g_cursor_active && !g_touch_down) {
+            input_release_pointer();
+        }
+        g_cursor_active = 0;
+    }
+    g_touchscreen = touchscreen;
+}
+
 void input_pump(void) {
     if (g_input_pumping) {
         return;
@@ -746,9 +1000,16 @@ void input_pump(void) {
 
     /* The game polls controller state and has no SDL event consumer. */
     g_sdl.PumpEvents();
+#ifdef __SWITCH__
+    /* Closing the game from Horizon's HOME menu arrives as SDL_QUIT. */
+    if (g_sdl.HasEvent && g_sdl.HasEvent(SDL_QUIT)) {
+        s3eDeviceRequestQuit();
+    }
+#endif
     g_sdl.FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
 
     uint64_t now = monotonic_ms();
+    input_refresh_touchscreen();
     input_refresh_controller(now);
     if (!g_controller) {
         goto out;
@@ -768,7 +1029,9 @@ void input_pump(void) {
     int select = input_button(SDL_BUTTON_BACK);
     if (select && !g_prev_select) {
         if (g_cursor_active) {
-            input_release_pointer();
+            if (!g_touch_down) {
+                input_release_pointer();
+            }
         } else {
             touchpad_release_all();
             keyboard_release_all();
@@ -778,23 +1041,49 @@ void input_pump(void) {
     }
     g_prev_select = select;
 
+    /* A finger on the screen has the pointer: the cursor's stick and button wait for it. */
     if (g_cursor_active) {
         touchpad_release_all();
         keyboard_release_all();
         input_reset_triggers();
-        input_update_cursor(dt);
+        if (!g_touch_down) {
+            input_update_cursor(dt);
+        }
     } else {
-        input_release_pointer();
+        if (!g_touch_down) {
+            input_release_pointer();
+        }
         input_update_game_touchpads();
-        input_update_game_keys();
+        input_update_game_keys(now);
     }
 
 out:
     g_input_pumping = 0;
 }
 
+void input_set_hud_handlers(const struct input_hud_handlers *handlers) {
+    memset(g_hud_buttons, 0, sizeof(g_hud_buttons));
+    g_frame_handler = NULL;
+    if (!handlers) {
+        return;
+    }
+    g_frame_handler = handlers->frame;
+    g_hud_buttons[HUD_BUTTON_RELOAD].press = handlers->reload;
+    g_hud_buttons[HUD_BUTTON_CHANGE_WEAPON].press = handlers->change_weapon;
+    g_hud_buttons[HUD_BUTTON_GRENADE].press = handlers->grenade_hold;
+    g_hud_buttons[HUD_BUTTON_GRENADE].release = handlers->grenade_throw;
+    g_hud_buttons[HUD_BUTTON_FIRE].press = handlers->fire;
+    g_hud_buttons[HUD_BUTTON_FIRE].repeat = 1;
+    g_hud_buttons[HUD_BUTTON_CROUCH].press = handlers->crouch;
+    g_hud_buttons[HUD_BUTTON_PRONE].press = handlers->prone;
+    g_hud_buttons[HUD_BUTTON_ACTION].press = handlers->action;
+    g_hud_buttons[HUD_BUTTON_SPRINT].press = handlers->sprint_start;
+    g_hud_buttons[HUD_BUTTON_SPRINT].release = handlers->sprint_stop;
+}
+
 void input_shutdown(void) {
     input_close_controller();
+    input_set_hud_handlers(NULL);
     if (g_sdl2) {
         if (g_sdl_initialized && g_sdl.QuitSubSystem) {
             g_sdl.QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER);
@@ -803,6 +1092,8 @@ void input_shutdown(void) {
         g_sdl2 = NULL;
     }
     memset(&g_sdl, 0, sizeof(g_sdl));
+    g_touchscreen = 0;
+    g_touch_down = 0;
     g_sdl_tried = 0;
     g_sdl_initialized = 0;
     g_input_pumping = 0;
@@ -844,6 +1135,10 @@ int32_t s3eKeyboardUnRegister(uint32_t id, void *callback) {
 int32_t s3eKeyboardUpdate(void) {
     input_pump();
     keyboard_publish();
+    hud_buttons_deliver();
+    if (g_frame_handler) {
+        g_frame_handler();
+    }
     dispatch_due_timers();
     return 0;
 }
@@ -1021,9 +1316,14 @@ int32_t s3ePointerGetY(void) {
     return g_pointer_y;
 }
 
+/* In gameplay the stick-driven cursor is not a touch; a finger on a touchscreen always is. */
+static int pointer_is_touch(void) {
+    return g_cursor_active || g_touchscreen;
+}
+
 int32_t s3ePointerGetTouchState(uint32_t touch_id) {
     input_pump();
-    if (g_cursor_active) {
+    if (pointer_is_touch()) {
         return touch_id == 0 ? g_pointer_states[0] : 0;
     }
     return 0;
@@ -1031,7 +1331,7 @@ int32_t s3ePointerGetTouchState(uint32_t touch_id) {
 
 int32_t s3ePointerGetTouchX(uint32_t touch_id) {
     input_pump();
-    if (g_cursor_active) {
+    if (pointer_is_touch()) {
         return touch_id == 0 ? g_pointer_x : 0;
     }
     return 0;
@@ -1039,7 +1339,7 @@ int32_t s3ePointerGetTouchX(uint32_t touch_id) {
 
 int32_t s3ePointerGetTouchY(uint32_t touch_id) {
     input_pump();
-    if (g_cursor_active) {
+    if (pointer_is_touch()) {
         return touch_id == 0 ? g_pointer_y : 0;
     }
     return 0;
@@ -1052,7 +1352,7 @@ int32_t s3ePointerGetPressure(uint32_t button) {
 
 int32_t s3ePointerGetTouchPressure(uint32_t touch_id) {
     input_pump();
-    if (g_cursor_active) {
+    if (pointer_is_touch()) {
         return touch_id == 0 && g_pointer_down ? 1 : 0;
     }
     return 0;

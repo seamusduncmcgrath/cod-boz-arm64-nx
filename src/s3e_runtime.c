@@ -112,12 +112,30 @@ int32_t s3eDeviceRequestQuit(void) {
     return 0;
 }
 
+/*
+ * The game runs on its own thread while main() waits for it. Returning to hbloader is only
+ * safe from the main thread, so ending the game means ending this thread.
+ */
 int32_t s3eDeviceAbort(void) {
-    _Exit(1);
+    pthread_exit(NULL);
 }
 
 int32_t s3eDeviceExit(void) {
-    _Exit(0);
+    pthread_exit(NULL);
+}
+
+/*
+ * What the game reports as an error or a failed assertion is the quickest way to see why it
+ * stopped. Its trace and debug output say nothing of use and are not kept.
+ */
+static void log_game_text(const char *kind, const char *text) {
+    size_t length = text ? strlen(text) : 0;
+    while (length && (text[length - 1] == '\n' || text[length - 1] == '\r')) {
+        length--;
+    }
+    if (length) {
+        fprintf(stderr, "[game] %s: %.*s\n", kind, (int)length, text);
+    }
 }
 
 void s3eDebugOutputString(const char *text) {
@@ -143,13 +161,15 @@ void s3eDebugTraceLine(const char *text) {
     (void)text;
 }
 
-int32_t s3eDebugAssertShow(void) {
+int32_t s3eDebugAssertShow(uint32_t type, const char *text) {
+    (void)type;
+    log_game_text("assert", text);
     return 0;
 }
 
 int32_t s3eDebugErrorShow(uint32_t flags, const char *text) {
     (void)flags;
-    (void)text;
+    log_game_text("error", text);
     return 0;
 }
 
@@ -172,6 +192,12 @@ int32_t s3eAccelerometerGetInt(uint32_t key) {
     (void)key;
     return 0;
 }
+int32_t s3eVibraVibrate(uint8_t priority, uint32_t ms) {
+    (void)priority;
+    (void)ms;
+    return 0;
+}
+
 int32_t s3eVideoGetInt(uint32_t key) {
     (void)key;
     return 0;
@@ -409,36 +435,48 @@ int32_t s3eExtGetHash(uint32_t hash, void *iface, uint32_t size) {
     return 1;
 }
 
-uintptr_t s3e_trampoline_dispatch(uint32_t index) {
-    (void)index;
+/*
+ * Horizon cannot generate code at runtime here, so unresolved imports share a fixed pool of C
+ * stubs. Each one names its import in the log the first time the game calls it.
+ */
+#define NAMED_STUB_INDICES(X)                                                                      \
+    X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+
+_Static_assert(S3E_NAMED_STUB_MAX == 16, "one stub is defined for each of sixteen indices");
+
+static uintptr_t named_stub_called(size_t index) {
+    static uint8_t reported[S3E_NAMED_STUB_MAX];
+    if (!reported[index]) {
+        reported[index] = 1;
+        fprintf(stderr, "[loader] the game called %s, which is not implemented\n",
+                g_stub_names[index]);
+    }
     return 0;
 }
 
+#define DEFINE_NAMED_STUB(index)                                                                   \
+    static uintptr_t named_stub_##index(void) {                                                    \
+        return named_stub_called(index);                                                           \
+    }
+NAMED_STUB_INDICES(DEFINE_NAMED_STUB)
+
+#define NAMED_STUB_ENTRY(index) named_stub_##index,
+static uintptr_t (*const g_named_stubs[S3E_NAMED_STUB_MAX])(void) = {
+    NAMED_STUB_INDICES(NAMED_STUB_ENTRY)};
+
 void *make_stub(const char *symbol) {
-    enum { STUB_SIZE = 20 };
-    if (!g_stub_code) {
-        g_stub_code_size = 16384;
-        g_stub_code = mmap(NULL, g_stub_code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (g_stub_code == MAP_FAILED) {
-            g_stub_code = NULL;
-            return (void *)(uintptr_t)&s3eStub;
+    const char *name = symbol ? symbol : "unknown";
+    for (size_t i = 0; i < g_stub_count; ++i) {
+        if (strcmp(g_stub_names[i], name) == 0) {
+            return (void *)(uintptr_t)g_named_stubs[i];
         }
     }
-    if (g_stub_count >= sizeof(g_stub_names) / sizeof(g_stub_names[0]) ||
-        (g_stub_count + 1) * STUB_SIZE > g_stub_code_size) {
+    if (g_stub_count >= S3E_NAMED_STUB_MAX) {
         return (void *)(uintptr_t)&s3eStub;
     }
     size_t index = g_stub_count++;
-    g_stub_names[index] = strdup(symbol ? symbol : "unknown");
-    uint32_t *code = (uint32_t *)(void *)(g_stub_code + index * STUB_SIZE);
-    code[0] = 0xe59f0004u;
-    code[1] = 0xe59ff004u;
-    code[2] = 0xe1a00000u;
-    code[3] = (uint32_t)index;
-    code[4] = (uint32_t)(uintptr_t)&s3e_trampoline_dispatch;
-    __builtin___clear_cache((char *)code, (char *)(code + 5));
-    return code;
+    g_stub_names[index] = strdup(name);
+    return (void *)(uintptr_t)g_named_stubs[index];
 }
 
 int32_t s3eRegisterNoop(uint32_t id, void *callback, void *user_data) {

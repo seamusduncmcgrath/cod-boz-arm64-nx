@@ -35,10 +35,11 @@ enum {
     S3E_AUDIO_CALLBACK_COUNT = 3,
 };
 
+/* As the game lays these out: its pointers, and one count, are 64 bits wide. */
 struct s3e_sound_end_sample_info {
     int32_t channel;
     int32_t reps_remaining;
-    uint32_t new_data;
+    const int16_t *new_data;
     uint32_t num_samples;
 };
 
@@ -60,22 +61,26 @@ struct audio_unit_buffer {
     uint32_t sample_rate;
 };
 
-typedef int32_t(S3E_SOFTFP *audio_unit_callback_fn)(struct audio_unit_buffer *buffer);
+typedef int32_t (*audio_unit_callback_fn)(struct audio_unit_buffer *buffer);
 
+/* The game reads the original sample count as 64 bits and flags a sample's end at offset 44. */
 struct s3e_sound_gen_audio_info {
     int32_t channel;
-    uint32_t target;
+    int16_t *target;
     uint32_t num_samples;
     int32_t mix;
-    uint32_t orig_start;
-    uint32_t orig_num_samples;
+    const int16_t *orig_start;
+    uintptr_t orig_num_samples;
     int32_t reps_remaining;
     uint32_t end_sample;
 };
 
-_Static_assert(sizeof(struct s3e_sound_end_sample_info) == 16,
+_Static_assert(offsetof(struct s3e_sound_end_sample_info, new_data) == 8 &&
+                   offsetof(struct s3e_sound_end_sample_info, num_samples) == 16,
                "s3eSoundEndSampleInfo ABI mismatch");
-_Static_assert(sizeof(struct s3e_sound_gen_audio_info) == 32, "s3eSoundGenAudioInfo ABI mismatch");
+_Static_assert(offsetof(struct s3e_sound_gen_audio_info, orig_num_samples) == 32 &&
+                   offsetof(struct s3e_sound_gen_audio_info, end_sample) == 44,
+               "s3eSoundGenAudioInfo ABI mismatch");
 
 struct sdl_audio_api {
     int (*InitSubSystem)(uint32_t flags);
@@ -393,16 +398,12 @@ static int render_generator_audio(int channel, const void *data, uint32_t sample
         if (requested > SOUND_GENERATOR_CHUNK_SAMPLES) {
             requested = SOUND_GENERATOR_CHUNK_SAMPLES;
         }
-        if ((uintptr_t)(pcm + written) > UINT32_MAX || (uintptr_t)data > UINT32_MAX) {
-            free(pcm);
-            return -1;
-        }
         struct s3e_sound_gen_audio_info info = {
             .channel = channel,
-            .target = (uint32_t)(uintptr_t)(pcm + written),
+            .target = pcm + written,
             .num_samples = requested,
             .mix = 0,
-            .orig_start = (uint32_t)(uintptr_t)data,
+            .orig_start = data,
             .orig_num_samples = samples,
             .reps_remaining = 0,
             .end_sample = 0,
@@ -498,15 +499,15 @@ static void service_finished_sound(void) {
         struct s3e_sound_end_sample_info info = {
             .channel = channel,
             .reps_remaining = (int32_t)reps_remaining,
-            .new_data = 0,
+            .new_data = NULL,
             .num_samples = source_samples,
         };
         const struct sound_callback *end_callback = &slot->callbacks[S3E_CHANNEL_END_SAMPLE];
         int32_t keep_playing = end_callback->function ? invoke_callback(end_callback, &info)
                                                       : repeat_forever || info.reps_remaining > 0;
         if (keep_playing) {
-            int new_data = info.new_data != 0;
-            const void *next_data = new_data ? (const void *)(uintptr_t)info.new_data : source_data;
+            int new_data = info.new_data != NULL;
+            const void *next_data = new_data ? (const void *)info.new_data : source_data;
             uint32_t next_samples = new_data ? info.num_samples : source_samples;
             uint32_t next_repeat = info.reps_remaining > 0 ? (uint32_t)info.reps_remaining : 0;
             if (next_data && next_samples &&
@@ -880,19 +881,44 @@ static uint8_t *read_audio_file(const char *path, uint32_t *out_size) {
     return data;
 }
 
+/*
+ * SDL_mixer 2.0 only takes data for MP3 when it starts with an ID3 tag or an MPEG-1 Layer III
+ * frame. The in-game music is untagged MPEG-2 (lower sample rates), which it rejects as an
+ * unknown format.
+ */
+static int is_untagged_mpeg_audio(const uint8_t *data, uint32_t size) {
+    return size >= 4 && data[0] == 0xff && (data[1] & 0xe0) == 0xe0 && (data[1] & 0x06) != 0 &&
+           (data[1] & 0xfe) != 0xfa;
+}
+
 static int play_audio_buffer(const void *buffer, uint32_t size, uint32_t repeat) {
-    if (!buffer || size == 0 || size > INT32_MAX) {
+    static const uint8_t empty_id3_tag[10] = {'I', 'D', '3', 3, 0, 0, 0, 0, 0, 0};
+    if (!buffer || size == 0 || size > INT32_MAX - sizeof(empty_id3_tag)) {
         return 1;
+    }
+
+    uint8_t *tagged = NULL;
+    if (is_untagged_mpeg_audio(buffer, size)) {
+        tagged = malloc(sizeof(empty_id3_tag) + size);
+        if (!tagged) {
+            return 1;
+        }
+        memcpy(tagged, empty_id3_tag, sizeof(empty_id3_tag));
+        memcpy(tagged + sizeof(empty_id3_tag), buffer, size);
+        buffer = tagged;
+        size += sizeof(empty_id3_tag);
     }
 
     void *rw = g_sdl_audio.RWFromConstMem(buffer, (int)size);
     if (!rw) {
+        free(tagged);
         return 1;
     }
 
     int channel = g_audio_channel;
     stop_audio_channel(channel, 1);
     void *chunk = g_mixer.LoadWAV_RW(rw, 1);
+    free(tagged);
     if (!chunk) {
         fprintf(stderr, "[audio] stream load failed on channel %d: %s\n", channel, mixer_error());
         return 1;
@@ -1016,12 +1042,8 @@ int32_t s3eAudioPlay(const char *filename, uint32_t repeat) {
         fprintf(stderr, "[audio] stream read failed: %s\n", path);
         return 1;
     }
-    int channel = g_audio_channel;
     int32_t result = play_audio_buffer(data, size, repeat);
     free(data);
-    if (result == 0) {
-        fprintf(stderr, "[audio] stream channel=%d repeat=%u file=%s\n", channel, repeat, filename);
-    }
     return result;
 }
 

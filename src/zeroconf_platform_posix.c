@@ -2,7 +2,9 @@
 
 #include "zeroconf_platform.h"
 
+#ifndef __SWITCH__
 #include <ifaddrs.h>
+#endif
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -14,6 +16,32 @@ enum {
 
 uint64_t zeroconf_platform_now_ms(void) {
     return monotonic_ms();
+}
+
+#ifdef __SWITCH__
+/* libnx has no getifaddrs; the console has one active interface and gethostid() reports it. */
+int zeroconf_platform_select_ipv4(struct in_addr *selected) {
+    if (!selected) {
+        return 0;
+    }
+    /* libnx returns the loopback constant unswapped when there is no connection. */
+    uint32_t address = (uint32_t)gethostid();
+    if (address == htonl(INADDR_ANY) || address == htonl(INADDR_LOOPBACK) ||
+        address == INADDR_LOOPBACK) {
+        return 0;
+    }
+    selected->s_addr = address;
+    return 1;
+}
+
+/* Horizon has no exec, so there is no close-on-exec flag to set. */
+static int set_close_on_exec(int socket_fd) {
+    (void)socket_fd;
+    return 1;
+}
+#else
+static int set_close_on_exec(int socket_fd) {
+    return ioctl(socket_fd, FIOCLEX) == 0;
 }
 
 int zeroconf_platform_select_ipv4(struct in_addr *selected) {
@@ -41,6 +69,7 @@ int zeroconf_platform_select_ipv4(struct in_addr *selected) {
     freeifaddrs(interfaces);
     return found;
 }
+#endif
 
 static int configure_socket(int socket_fd, struct in_addr interface_address) {
     int enabled = 1;
@@ -67,7 +96,7 @@ static int configure_socket(int socket_fd, struct in_addr interface_address) {
            setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) == 0 &&
            setsockopt(socket_fd, IPPROTO_IP, IP_MULTICAST_IF, &interface_address,
                       sizeof(interface_address)) == 0 &&
-           ioctl(socket_fd, FIONBIO, &enabled) == 0 && ioctl(socket_fd, FIOCLEX) == 0 &&
+           ioctl(socket_fd, FIONBIO, &enabled) == 0 && set_close_on_exec(socket_fd) &&
            bind(socket_fd, (const struct sockaddr *)&address, sizeof(address)) == 0 &&
            (setsockopt(socket_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &multicast, sizeof(multicast)) ==
                 0 ||

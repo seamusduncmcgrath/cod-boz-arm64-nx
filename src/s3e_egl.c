@@ -51,6 +51,8 @@ enum {
     EGL_CONTEXT_CLIENT_TYPE = 0x3097,
     EGL_CONTEXT_CLIENT_VERSION = 0x3098,
     EGL_OPENGL_ES_API = 0x30a0,
+    /* The newest OpenGL ES there is a version of. */
+    NEWEST_GLES_VERSION = 3,
 };
 
 struct sdl_video_api {
@@ -244,7 +246,7 @@ bool egl_backend_load_libraries(void) {
     char gles2_error[512];
 
     if (!load_sdl_video()) {
-        fprintf(stderr, "[egl] SDL2 video library is unavailable\n");
+        fprintf(stderr, "[video] SDL2 video library is unavailable\n");
         return false;
     }
     configure_sdl_graphics_libraries();
@@ -257,15 +259,15 @@ bool egl_backend_load_libraries(void) {
                                     gles2_error, sizeof(gles2_error));
     if (!g_egl || !g_gles1 || !g_gles2) {
         if (!g_egl) {
-            fprintf(stderr, "[egl] EGL load failed: %s\n", egl_error);
+            fprintf(stderr, "[video] EGL load failed: %s\n", egl_error);
         }
         if (!g_gles1) {
-            fprintf(stderr, "[egl] OpenGL ES 1 load failed: %s\n", gles1_error);
+            fprintf(stderr, "[video] OpenGL ES 1 load failed: %s\n", gles1_error);
         }
         if (!g_gles2) {
-            fprintf(stderr, "[egl] OpenGL ES 2 load failed: %s\n", gles2_error);
+            fprintf(stderr, "[video] OpenGL ES 2 load failed: %s\n", gles2_error);
         }
-        fprintf(stderr, "[egl] compatible EGL and OpenGL ES libraries are required\n");
+        fprintf(stderr, "[video] compatible EGL and OpenGL ES libraries are required\n");
         if (g_egl) {
             dlclose(g_egl);
             g_egl = NULL;
@@ -296,15 +298,13 @@ static int initialize_sdl(EGLDisplay display) {
     /* The S3E loader owns fault handlers used by its compatibility boundary. */
     setenv("SDL_NO_SIGNAL_HANDLERS", "1", 1);
     if (g_sdl.api.InitSubSystem(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "[egl] SDL video initialization failed: %s\n", sdl_error());
+        fprintf(stderr, "[video] SDL video initialization failed: %s\n", sdl_error());
         set_error(EGL_NOT_INITIALIZED);
         return 0;
     }
     g_sdl.initialized = 1;
     g_sdl.display = display ? display : fallback_display();
     g_sdl.active = 1;
-    fprintf(stderr, "[egl] using SDL video backend driver=%s\n",
-            g_sdl.api.GetCurrentVideoDriver ? g_sdl.api.GetCurrentVideoDriver() : "unknown");
     return 1;
 }
 
@@ -312,12 +312,9 @@ static int uses_sdl(EGLDisplay display) {
     return g_sdl.active && (!display || display == g_sdl.display || display == fallback_display());
 }
 
+/* The fbdev-style window the game hands to EGL means nothing to Horizon's native EGL. */
 static int sdl_owns_display(void) {
-    const char *wayland_display = getenv("WAYLAND_DISPLAY");
-    const char *x11_display = getenv("DISPLAY");
-    const char *video_driver = getenv("SDL_VIDEODRIVER");
-    return (wayland_display && wayland_display[0]) || (x11_display && x11_display[0]) ||
-           (video_driver && strcmp(video_driver, "kmsdrm") == 0);
+    return 1;
 }
 
 static void apply_window_attributes(void) {
@@ -343,11 +340,10 @@ static int ensure_window(void) {
         g_native_window.width, g_native_window.height,
         SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN);
     if (!g_sdl.window) {
-        fprintf(stderr, "[egl] SDL window creation failed: %s\n", sdl_error());
+        fprintf(stderr, "[video] SDL window creation failed: %s\n", sdl_error());
         set_error(EGL_BAD_NATIVE_WINDOW);
         return 0;
     }
-    fprintf(stderr, "[egl] SDL window size=%ux%u\n", g_native_window.width, g_native_window.height);
     return 1;
 }
 
@@ -361,11 +357,19 @@ static int ensure_context(void) {
     apply_window_attributes();
     g_sdl.context = g_sdl.api.GL_CreateContext(g_sdl.window);
     if (!g_sdl.context) {
-        fprintf(stderr, "[egl] SDL OpenGL ES %d context creation failed: %s\n", g_sdl.context_major,
-                sdl_error());
+        /*
+         * The game works down from versions that do not exist, 5 and 4, so only a refusal of
+         * one that does is worth a line.
+         */
+        if (g_sdl.context_major <= NEWEST_GLES_VERSION) {
+            fprintf(stderr, "[video] OpenGL ES %d context creation failed: %s\n",
+                    g_sdl.context_major, sdl_error());
+        }
         set_error(EGL_BAD_CONTEXT);
         return 0;
     }
+    fprintf(stderr, "[video] OpenGL ES %d on a %ux%u window\n", g_sdl.context_major,
+            g_native_window.width, g_native_window.height);
     return 1;
 }
 
@@ -396,10 +400,10 @@ static EGLBoolean host_eglInitialize(EGLDisplay display, EGLint *major, EGLint *
     EGLint native_error = native_display && get_error ? get_error() : EGL_NOT_INITIALIZED;
     if (!initialize_sdl(display)) {
         if (native_display) {
-            fprintf(stderr, "[egl] native EGL failed (0x%04x) and SDL fallback is unavailable\n",
+            fprintf(stderr, "[video] native EGL failed (0x%04x) and SDL fallback is unavailable\n",
                     native_error);
         } else {
-            fprintf(stderr, "[egl] SDL video was requested but is unavailable\n");
+            fprintf(stderr, "[video] SDL video was requested but is unavailable\n");
         }
         return 0;
     }
@@ -410,10 +414,8 @@ static EGLBoolean host_eglInitialize(EGLDisplay display, EGLint *major, EGLint *
         *minor = 4;
     }
     if (native_display) {
-        fprintf(stderr, "[egl] native EGL failed (0x%04x); SDL owns the display surface\n",
+        fprintf(stderr, "[video] native EGL failed (0x%04x); SDL owns the display surface\n",
                 native_error);
-    } else {
-        fprintf(stderr, "[egl] using an SDL window surface\n");
     }
     return 1;
 }
@@ -544,7 +546,7 @@ static EGLBoolean host_eglMakeCurrent(EGLDisplay display, EGLSurface draw, EGLSu
             return 0;
         }
         if (g_sdl.window && g_sdl.api.GL_MakeCurrent(g_sdl.window, NULL) != 0) {
-            fprintf(stderr, "[egl] SDL release-current failed: %s\n", sdl_error());
+            fprintf(stderr, "[video] SDL release-current failed: %s\n", sdl_error());
             set_error(EGL_BAD_CONTEXT);
             return 0;
         }
@@ -562,7 +564,7 @@ static EGLBoolean host_eglMakeCurrent(EGLDisplay display, EGLSurface draw, EGLSu
         return 0;
     }
     if (g_sdl.api.GL_MakeCurrent(g_sdl.window, g_sdl.context) != 0) {
-        fprintf(stderr, "[egl] SDL make-current failed: %s\n", sdl_error());
+        fprintf(stderr, "[video] SDL make-current failed: %s\n", sdl_error());
         set_error(EGL_BAD_CONTEXT);
         return 0;
     }

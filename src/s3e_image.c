@@ -1,19 +1,29 @@
 #include "s3e_image.h"
 
+#include "LzmaDec.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE MAP_FIXED
-#endif
+#include "switch_code_memory.h"
 
 #define S3E_MAGIC 0x55334558u
+
+/*
+ * The game's package holds the image as an LZMA "alone" file: the decoder's properties, the size
+ * it unpacks to as 64 bits, then the stream.
+ */
+enum {
+    PACKED_SIZE_OFFSET = LZMA_PROPS_SIZE,
+    PACKED_STREAM_OFFSET = LZMA_PROPS_SIZE + 8,
+    /* Several times what any build of the game unpacks to: a size beyond it is not one. */
+    MAX_UNPACKED_SIZE = 64 * 1024 * 1024,
+};
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -28,9 +38,53 @@ static bool range_ok(size_t size, uint32_t offset, uint32_t length) {
 }
 
 static size_t page_round(size_t size) {
-    long page = sysconf(_SC_PAGESIZE);
-    size_t mask = (size_t)page - 1;
+    size_t mask = (size_t)SWITCH_PAGE_SIZE - 1;
     return (size + mask) & ~mask;
+}
+
+static void *unpack_alloc(ISzAllocPtr allocator, size_t size) {
+    (void)allocator;
+    return malloc(size);
+}
+
+static void unpack_free(ISzAllocPtr allocator, void *address) {
+    (void)allocator;
+    free(address);
+}
+
+/*
+ * Replaces a packed image with what it unpacks to. Anything that does not unpack to exactly the
+ * size it declares is left as it was read.
+ */
+static void unpack_image(struct s3e_image *image) {
+    const uint8_t *packed = image->file_data;
+    if (image->file_size <= PACKED_STREAM_OFFSET) {
+        return;
+    }
+    uint64_t size = rd32(packed + PACKED_SIZE_OFFSET) |
+                    ((uint64_t)rd32(packed + PACKED_SIZE_OFFSET + 4) << 32);
+    if (size > MAX_UNPACKED_SIZE) {
+        return;
+    }
+
+    uint8_t *unpacked = malloc((size_t)size);
+    if (!unpacked) {
+        return;
+    }
+    SizeT unpacked_size = (SizeT)size;
+    SizeT packed_size = image->file_size - PACKED_STREAM_OFFSET;
+    ELzmaStatus status = LZMA_STATUS_NOT_SPECIFIED;
+    ISzAlloc allocator = {unpack_alloc, unpack_free};
+    SRes result = LzmaDecode(unpacked, &unpacked_size, packed + PACKED_STREAM_OFFSET, &packed_size,
+                             packed, LZMA_PROPS_SIZE, LZMA_FINISH_END, &status, &allocator);
+    if (result != SZ_OK || unpacked_size != size) {
+        free(unpacked);
+        return;
+    }
+
+    free(image->file_data);
+    image->file_data = unpacked;
+    image->file_size = unpacked_size;
 }
 
 bool s3e_image_load(const char *path, struct s3e_image *image) {
@@ -38,13 +92,13 @@ bool s3e_image_load(const char *path, struct s3e_image *image) {
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "[loader] open %s: %s\n", path, strerror(errno));
         return false;
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-        fprintf(stderr, "stat %s failed\n", path);
+        fprintf(stderr, "[loader] stat %s failed\n", path);
         close(fd);
         return false;
     }
@@ -60,7 +114,7 @@ bool s3e_image_load(const char *path, struct s3e_image *image) {
     while (done < image->file_size) {
         ssize_t got = read(fd, image->file_data + done, image->file_size - done);
         if (got <= 0) {
-            fprintf(stderr, "read %s failed\n", path);
+            fprintf(stderr, "[loader] read %s failed\n", path);
             close(fd);
             s3e_image_free(image);
             return false;
@@ -69,8 +123,13 @@ bool s3e_image_load(const char *path, struct s3e_image *image) {
     }
     close(fd);
 
+    /* An image is taken as the game's package has it or already unpacked. */
+    if (image->file_size >= 4 && rd32(image->file_data) != S3E_MAGIC) {
+        unpack_image(image);
+    }
+
     if (image->file_size < 68) {
-        fprintf(stderr, "%s is too small for an S3E header\n", path);
+        fprintf(stderr, "[loader] %s is too small for an S3E header\n", path);
         s3e_image_free(image);
         return false;
     }
@@ -98,7 +157,7 @@ bool s3e_image_load(const char *path, struct s3e_image *image) {
     h->ext_header_size = rd32(p + 64);
 
     if (h->ident != S3E_MAGIC) {
-        fprintf(stderr, "%s is not an uncompressed S3E image\n", path);
+        fprintf(stderr, "[loader] %s is not an S3E image, packed or unpacked\n", path);
         s3e_image_free(image);
         return false;
     }
@@ -115,7 +174,7 @@ bool s3e_image_load(const char *path, struct s3e_image *image) {
     if (!range_ok(image->file_size, h->fixup_offset, h->fixup_size) ||
         !range_ok(image->file_size, h->code_offset, h->code_file_size) ||
         h->code_file_size > h->code_mem_size || h->entry_offset >= h->code_mem_size) {
-        fprintf(stderr, "S3E header ranges are invalid\n");
+        fprintf(stderr, "[loader] S3E header ranges are invalid\n");
         s3e_image_free(image);
         return false;
     }
@@ -198,8 +257,24 @@ bool s3e_image_parse_symbols(struct s3e_image *image) {
     return image->symbols.count > 0;
 }
 
+/* Relocation slots hold the image's pointers, which are 64 bits wide. */
+static uintptr_t read_slot(const uint8_t *slot) {
+    uintptr_t value;
+    memcpy(&value, slot, sizeof(value));
+    return value;
+}
+
+static void write_slot(uint8_t *slot, uintptr_t value) {
+    memcpy(slot, &value, sizeof(value));
+}
+
+static bool slot_in_image(const struct s3e_image *image, uint32_t offset) {
+    return image->header.code_mem_size >= sizeof(uintptr_t) &&
+           offset <= image->header.code_mem_size - sizeof(uintptr_t);
+}
+
 static bool apply_internal_relocs(const struct s3e_image *image, uint8_t *base, uint32_t pos,
-                                  uint32_t size, int32_t load_delta) {
+                                  uint32_t size, uintptr_t load_delta) {
     const uint8_t *data = image->file_data;
     uint32_t body = pos + 8;
     if (size < 12) {
@@ -215,11 +290,19 @@ static bool apply_internal_relocs(const struct s3e_image *image, uint8_t *base, 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t offset = rd32(data + cursor);
         cursor += 4;
-        if (offset > image->header.code_mem_size - 4) {
+        if (!slot_in_image(image, offset)) {
             return false;
         }
-        uint32_t *slot = (uint32_t *)(void *)(base + offset);
-        *slot += (uint32_t)load_delta;
+        uint8_t *slot = base + offset;
+        uintptr_t value = read_slot(slot);
+        /* The 32-bit build of the game, read through these slots, points outside itself. */
+        if (value - image->header.base_addr_orig > image->header.code_mem_size) {
+            fprintf(stderr, "[loader] relocation 0x%x does not point into the image: this is "
+                            "not the 64-bit (AArch64) build of the game\n",
+                    offset);
+            return false;
+        }
+        write_slot(slot, value + load_delta);
     }
 
     return true;
@@ -246,48 +329,87 @@ static bool apply_external_relocs(const struct s3e_image *image, uint8_t *base, 
         cursor += 6;
 
         uint32_t offset = (hi << 16) | lo;
-        if (offset > image->header.code_mem_size - 4 || symbol_index >= image->symbols.count) {
+        if (!slot_in_image(image, offset) || symbol_index >= image->symbols.count) {
             return false;
         }
 
         const char *symbol = image->symbols.items[symbol_index];
         void *addr = resolve(symbol);
         if (!addr) {
-            fprintf(stderr, "unresolved import: %s\n", symbol);
+            fprintf(stderr, "[loader] unresolved import: %s\n", symbol);
             return false;
         }
 
-        uint32_t *slot = (uint32_t *)(void *)(base + offset);
-        *slot = (uint32_t)(uintptr_t)addr;
+        write_slot(base + offset, (uintptr_t)addr);
     }
 
     return true;
+}
+
+/*
+ * Where the image is built and where it runs. Horizon never maps a page writable and
+ * executable, so the image is assembled in heap memory and only becomes runnable, at a different
+ * address, once mapping_finish() remaps it.
+ */
+struct image_mapping {
+    uint8_t *write_base;
+    uint8_t *run_base;
+    size_t size;
+};
+
+static struct switch_code_memory g_code_memory;
+
+/* Everything below the image's data offset is code and constants; the rest must stay writable. */
+static size_t executable_size(const struct s3e_header *h) {
+    return h->data_offset & ~(size_t)(SWITCH_PAGE_SIZE - 1);
+}
+
+static bool mapping_create(const struct s3e_header *h, size_t size, struct image_mapping *mapping) {
+    if (!executable_size(h) || executable_size(h) >= size) {
+        fprintf(stderr, "[loader] S3E image does not declare where its writable data starts\n");
+        return false;
+    }
+    if (!switch_code_memory_reserve(&g_code_memory, size)) {
+        fprintf(stderr, "[loader] unable to reserve 0x%zx bytes of code memory\n", size);
+        return false;
+    }
+    mapping->write_base = g_code_memory.backing;
+    mapping->run_base = g_code_memory.address;
+    mapping->size = size;
+    return true;
+}
+
+static bool mapping_finish(const struct s3e_header *h, struct image_mapping *mapping) {
+    (void)mapping;
+    return switch_code_memory_commit(&g_code_memory, executable_size(h));
+}
+
+static void mapping_destroy(struct image_mapping *mapping) {
+    (void)mapping;
+    switch_code_memory_release(&g_code_memory);
 }
 
 bool s3e_image_map_and_relocate(const struct s3e_image *image, void *(*resolve)(const char *symbol),
                                 struct s3e_loaded_image *loaded) {
     memset(loaded, 0, sizeof(*loaded));
     const struct s3e_header *h = &image->header;
-    size_t map_size = page_round(h->code_mem_size);
-    void *want = (void *)(uintptr_t)h->base_addr_orig;
-    uint8_t *base = mmap(want, map_size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (base == MAP_FAILED) {
-        fprintf(stderr, "mmap 0x%08x: %s\n", h->base_addr_orig, strerror(errno));
+    struct image_mapping mapping;
+    if (!mapping_create(h, page_round(h->code_mem_size), &mapping)) {
         return false;
     }
+    uint8_t *base = mapping.write_base;
 
     memcpy(base, image->file_data + h->code_offset, h->code_file_size);
     memset(base + h->code_file_size, 0, h->code_mem_size - h->code_file_size);
 
     uint32_t pos = h->fixup_offset;
     uint32_t end = h->fixup_offset + h->fixup_size;
-    int32_t load_delta = (int32_t)((uint32_t)(uintptr_t)base - h->base_addr_orig);
+    uintptr_t load_delta = (uintptr_t)mapping.run_base - h->base_addr_orig;
     while (pos < end) {
         uint32_t type = rd32(image->file_data + pos);
         uint32_t size = rd32(image->file_data + pos + 4);
         if (size < 8 || size > end - pos) {
-            munmap(base, map_size);
+            mapping_destroy(&mapping);
             return false;
         }
 
@@ -299,22 +421,32 @@ bool s3e_image_map_and_relocate(const struct s3e_image *image, void *(*resolve)(
         }
 
         if (!ok) {
-            munmap(base, map_size);
+            mapping_destroy(&mapping);
             return false;
         }
 
         pos += size;
     }
 
-    loaded->base = base;
-    loaded->map_size = map_size;
+    if (!mapping_finish(h, &mapping)) {
+        mapping_destroy(&mapping);
+        return false;
+    }
+
+    loaded->base = mapping.run_base;
+    loaded->map_size = mapping.size;
     loaded->entry_offset = h->entry_offset;
     return true;
 }
 
 void s3e_loaded_image_unmap(struct s3e_loaded_image *loaded) {
     if (loaded && loaded->base) {
-        munmap(loaded->base, loaded->map_size);
+        struct image_mapping mapping = {
+            .write_base = loaded->base,
+            .run_base = loaded->base,
+            .size = loaded->map_size,
+        };
+        mapping_destroy(&mapping);
         memset(loaded, 0, sizeof(*loaded));
     }
 }

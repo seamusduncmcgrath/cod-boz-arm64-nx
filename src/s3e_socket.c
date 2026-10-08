@@ -197,7 +197,12 @@ static int set_nonblocking(int fd) {
     if (ioctl(fd, FIONBIO, &enabled) < 0) {
         return -1;
     }
+#ifdef __SWITCH__
+    /* Horizon has no exec, so there is no close-on-exec flag to set. */
+    return 0;
+#else
     return ioctl(fd, FIOCLEX) < 0 ? -1 : 0;
+#endif
 }
 
 static int socket_family(int32_t domain) {
@@ -397,6 +402,31 @@ int32_t s3eInetAton(uint32_t *out, const char *address) {
         return S3E_RESULT_ERROR;
     }
     *out = parsed.s_addr;
+    set_socket_error(S3E_SOCKET_ERR_NONE);
+    return S3E_RESULT_SUCCESS;
+}
+
+/*
+ * The game's call sites pass the text, a byte buffer and the buffer's capacity (4 or 16+), and
+ * read back 4 or 16 for the address family that parsed.
+ */
+int32_t s3eInetPton(const char *address, void *out, uint32_t *length) {
+    uint8_t parsed[sizeof(struct in6_addr)];
+    uint32_t parsed_length = 0;
+    if (address && out && length) {
+        if (*length >= sizeof(struct in_addr) && inet_pton(AF_INET, address, parsed) == 1) {
+            parsed_length = sizeof(struct in_addr);
+        } else if (*length >= sizeof(struct in6_addr) &&
+                   inet_pton(AF_INET6, address, parsed) == 1) {
+            parsed_length = sizeof(struct in6_addr);
+        }
+    }
+    if (!parsed_length) {
+        set_socket_error(S3E_SOCKET_ERR_PARAM);
+        return S3E_RESULT_ERROR;
+    }
+    memcpy(out, parsed, parsed_length);
+    *length = parsed_length;
     set_socket_error(S3E_SOCKET_ERR_NONE);
     return S3E_RESULT_SUCCESS;
 }

@@ -1,43 +1,43 @@
 #include "s3e_host_internal.h"
 
 #define GL_WRAP_FLOAT1(name, t1)                                                                   \
-    static S3E_SOFTFP void host_##name(t1 a) {                                                     \
+    static void host_##name(t1 a) {                                                                \
         void (*real)(t1) = lookup_gl(#name);                                                       \
         if (real)                                                                                  \
             real(a);                                                                               \
     }
 #define GL_WRAP_FLOAT2(name, t1, t2)                                                               \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b) {                                               \
+    static void host_##name(t1 a, t2 b) {                                                          \
         void (*real)(t1, t2) = lookup_gl(#name);                                                   \
         if (real)                                                                                  \
             real(a, b);                                                                            \
     }
 #define GL_WRAP_FLOAT3(name, t1, t2, t3)                                                           \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b, t3 c) {                                         \
+    static void host_##name(t1 a, t2 b, t3 c) {                                                    \
         void (*real)(t1, t2, t3) = lookup_gl(#name);                                               \
         if (real)                                                                                  \
             real(a, b, c);                                                                         \
     }
 #define GL_WRAP_FLOAT4(name, t1, t2, t3, t4)                                                       \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b, t3 c, t4 d) {                                   \
+    static void host_##name(t1 a, t2 b, t3 c, t4 d) {                                              \
         void (*real)(t1, t2, t3, t4) = lookup_gl(#name);                                           \
         if (real)                                                                                  \
             real(a, b, c, d);                                                                      \
     }
 #define GL_WRAP_FLOAT5(name, t1, t2, t3, t4, t5)                                                   \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b, t3 c, t4 d, t5 e) {                             \
+    static void host_##name(t1 a, t2 b, t3 c, t4 d, t5 e) {                                        \
         void (*real)(t1, t2, t3, t4, t5) = lookup_gl(#name);                                       \
         if (real)                                                                                  \
             real(a, b, c, d, e);                                                                   \
     }
 #define GL_WRAP_FLOAT6(name, t1, t2, t3, t4, t5, t6)                                               \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b, t3 c, t4 d, t5 e, t6 f) {                       \
+    static void host_##name(t1 a, t2 b, t3 c, t4 d, t5 e, t6 f) {                                  \
         void (*real)(t1, t2, t3, t4, t5, t6) = lookup_gl(#name);                                   \
         if (real)                                                                                  \
             real(a, b, c, d, e, f);                                                                \
     }
 #define GL_WRAP_FLOAT1_ALIAS(name, fallback, t1)                                                   \
-    static S3E_SOFTFP void host_##name(t1 a) {                                                     \
+    static void host_##name(t1 a) {                                                                \
         void (*real)(t1) = lookup_gl(#name);                                                       \
         if (!real)                                                                                 \
             real = lookup_gl(#fallback);                                                           \
@@ -45,7 +45,7 @@
             real(a);                                                                               \
     }
 #define GL_WRAP_FLOAT2_ALIAS(name, fallback, t1, t2)                                               \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b) {                                               \
+    static void host_##name(t1 a, t2 b) {                                                          \
         void (*real)(t1, t2) = lookup_gl(#name);                                                   \
         if (!real)                                                                                 \
             real = lookup_gl(#fallback);                                                           \
@@ -53,7 +53,7 @@
             real(a, b);                                                                            \
     }
 #define GL_WRAP_FLOAT6_ALIAS(name, fallback, t1, t2, t3, t4, t5, t6)                               \
-    static S3E_SOFTFP void host_##name(t1 a, t2 b, t3 c, t4 d, t5 e, t6 f) {                       \
+    static void host_##name(t1 a, t2 b, t3 c, t4 d, t5 e, t6 f) {                                  \
         void (*real)(t1, t2, t3, t4, t5, t6) = lookup_gl(#name);                                   \
         if (!real)                                                                                 \
             real = lookup_gl(#fallback);                                                           \
@@ -63,7 +63,7 @@
 
 enum {
     FRAME_INTERVAL_US = 16667,
-    FRAME_RESET_US = FRAME_INTERVAL_US * 4,
+    FRAME_RESET_FRAMES = 4,
     REFERENCE_SURFACE_WIDTH = 640,
     REFERENCE_SURFACE_HEIGHT = 480,
     GL_VIEWPORT_VALUE = 0x0ba2,
@@ -99,16 +99,25 @@ static void sleep_until_us(uint64_t target_us) {
     }
 }
 
+static uint32_t g_frame_interval_us = FRAME_INTERVAL_US;
+
+void video_set_frame_rate(uint32_t frames_per_second) {
+    if (frames_per_second) {
+        g_frame_interval_us = (1000000u + frames_per_second / 2) / frames_per_second;
+    }
+}
+
 static void pace_frame(void) {
     static uint64_t next_frame_us;
     uint64_t now = monotonic_us();
+    uint64_t reset_us = (uint64_t)g_frame_interval_us * FRAME_RESET_FRAMES;
 
-    if (!next_frame_us || now > next_frame_us + FRAME_RESET_US) {
-        next_frame_us = now + FRAME_INTERVAL_US;
+    if (!next_frame_us || now > next_frame_us + reset_us) {
+        next_frame_us = now + g_frame_interval_us;
     }
 
     sleep_until_us(next_frame_us);
-    next_frame_us += FRAME_INTERVAL_US;
+    next_frame_us += g_frame_interval_us;
 }
 
 GL_WRAP_FLOAT2(glAlphaFunc, GLenum, GLfloat)
@@ -158,15 +167,15 @@ static void bind_framebuffer(GLenum target, GLuint framebuffer) {
     }
 }
 
-static S3E_SOFTFP void host_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+static void host_glBindFramebuffer(GLenum target, GLuint framebuffer) {
     bind_framebuffer(target, framebuffer);
 }
 
-static S3E_SOFTFP void host_glBindFramebufferOES(GLenum target, GLuint framebuffer) {
+static void host_glBindFramebufferOES(GLenum target, GLuint framebuffer) {
     bind_framebuffer(target, framebuffer);
 }
 
-static S3E_SOFTFP void host_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+static void host_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     void (*real)(GLint, GLint, GLsizei, GLsizei) = lookup_gl("glViewport");
     if (real) {
         if (!g_bound_framebuffer) {
@@ -177,7 +186,7 @@ static S3E_SOFTFP void host_glViewport(GLint x, GLint y, GLsizei width, GLsizei 
     }
 }
 
-static S3E_SOFTFP void host_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+static void host_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
     void (*real)(GLint, GLint, GLsizei, GLsizei) = lookup_gl("glScissor");
     if (real) {
         if (!g_bound_framebuffer) {
@@ -213,7 +222,7 @@ static void map_drawable_rect_to_surface(GLint *rect) {
     rect[3] = top > bottom ? top - bottom : 0;
 }
 
-static S3E_SOFTFP void host_glGetIntegerv(GLenum name, GLint *values) {
+static void host_glGetIntegerv(GLenum name, GLint *values) {
     void (*real)(GLenum, GLint *) = lookup_gl("glGetIntegerv");
     if (!real) {
         return;
@@ -225,8 +234,8 @@ static S3E_SOFTFP void host_glGetIntegerv(GLenum name, GLint *values) {
     }
 }
 
-static S3E_SOFTFP void host_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
-                                         GLenum format, GLenum type, void *pixels) {
+static void host_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
+                              GLenum type, void *pixels) {
     void (*real)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *) =
         lookup_gl("glReadPixels");
     if (real) {
@@ -238,9 +247,8 @@ static S3E_SOFTFP void host_glReadPixels(GLint x, GLint y, GLsizei width, GLsize
     }
 }
 
-static S3E_SOFTFP void host_glCopyTexImage2D(GLenum target, GLint level, GLenum internal_format,
-                                             GLint x, GLint y, GLsizei width, GLsizei height,
-                                             GLint border) {
+static void host_glCopyTexImage2D(GLenum target, GLint level, GLenum internal_format, GLint x,
+                                  GLint y, GLsizei width, GLsizei height, GLint border) {
     void (*real)(GLenum, GLint, GLenum, GLint, GLint, GLsizei, GLsizei, GLint) =
         lookup_gl("glCopyTexImage2D");
     if (real) {
@@ -252,9 +260,8 @@ static S3E_SOFTFP void host_glCopyTexImage2D(GLenum target, GLint level, GLenum 
     }
 }
 
-static S3E_SOFTFP void host_glCopyTexSubImage2D(GLenum target, GLint level, GLint x_offset,
-                                                GLint y_offset, GLint x, GLint y, GLsizei width,
-                                                GLsizei height) {
+static void host_glCopyTexSubImage2D(GLenum target, GLint level, GLint x_offset, GLint y_offset,
+                                     GLint x, GLint y, GLsizei width, GLsizei height) {
     void (*real)(GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei) =
         lookup_gl("glCopyTexSubImage2D");
     if (real) {
@@ -448,6 +455,8 @@ static const struct host_symbol HOST_SYMBOLS[] = {
     HOST(s3eFileAddUserFileSys),
     HOST(s3eFileListDirectory),
     HOST(s3eFileListClose),
+    HOST(s3eSecureStorageGet),
+    HOST(s3eSecureStoragePut),
     HOST(s3eCompressionDecomp),
     HOST(s3eCompressionDecompInit),
     HOST(s3eCompressionDecompRead),
@@ -509,6 +518,7 @@ static const struct host_symbol HOST_SYMBOLS[] = {
     HOST(s3eAccelerometerGetY),
     HOST(s3eAccelerometerGetZ),
     HOST(s3eAccelerometerGetInt),
+    HOST(s3eVibraVibrate),
     HOST(s3eVideoGetInt),
     HOST(s3eVideoPlay),
     HOST(s3eVideoStop),
@@ -538,6 +548,7 @@ static const struct host_symbol HOST_SYMBOLS[] = {
     HOST(s3eInetHtons),
     HOST(s3eInetNtohs),
     HOST(s3eInetAton),
+    HOST(s3eInetPton),
     HOST(s3eInetNtoa),
     HOST(s3eInetToString),
     HOST(s3eInetLookup),

@@ -4,12 +4,8 @@ char g_root[1024];
 void *g_egl;
 void *g_gles1;
 void *g_gles2;
-uint8_t *g_stub_code;
-size_t g_stub_code_size;
-const char *g_stub_names[512];
+const char *g_stub_names[S3E_NAMED_STUB_MAX];
 size_t g_stub_count;
-struct dtrz_index g_dtrz;
-struct memory_file *g_memory_files;
 struct timer_event *g_timers;
 pthread_mutex_t g_timer_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct fbdev_window g_native_window = {640, 480};
@@ -123,13 +119,10 @@ bool s3e_host_init(const char *root) {
     }
     if (!g_surface_pixels &&
         !s3e_host_set_display_size(g_native_window.width, g_native_window.height)) {
-        fprintf(stderr, "failed to allocate %ux%u S3E surface\n", g_native_window.width,
+        fprintf(stderr, "[video] failed to allocate a %ux%u surface\n", g_native_window.width,
                 g_native_window.height);
         return false;
     }
-    fprintf(stderr, "[display] drawable=%ux%u surface=%ux%u offset=%u,%u pitch=%zu\n",
-            g_native_window.width, g_native_window.height, g_surface.width, g_surface.height,
-            g_surface.x, g_surface.y, (size_t)g_surface.width * sizeof(*g_surface_pixels));
     return egl_backend_load_libraries();
 }
 
@@ -145,16 +138,6 @@ static void clear_timers(void) {
     }
 }
 
-static void close_all_memory_files(void) {
-    while (g_memory_files) {
-        struct memory_file *next = g_memory_files->next;
-        fclose(g_memory_files->file);
-        free(g_memory_files->buffer);
-        free(g_memory_files);
-        g_memory_files = next;
-    }
-}
-
 void s3e_host_shutdown(void) {
     (void)s3eMemorySetUserMemMgr(NULL);
     s3e_zero_conf_shutdown();
@@ -163,7 +146,6 @@ void s3e_host_shutdown(void) {
     input_shutdown();
     egl_backend_shutdown();
     clear_timers();
-    close_all_memory_files();
     free(g_surface_pixels);
     g_surface_pixels = NULL;
     s3e_memory_shutdown();
@@ -171,11 +153,6 @@ void s3e_host_shutdown(void) {
         free((void *)g_stub_names[i]);
     }
     g_stub_count = 0;
-    if (g_stub_code) {
-        munmap(g_stub_code, g_stub_code_size);
-        g_stub_code = NULL;
-        g_stub_code_size = 0;
-    }
     if (g_egl) {
         dlclose(g_egl);
         g_egl = NULL;
